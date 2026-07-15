@@ -167,8 +167,57 @@ int main()
     constexpr std::array<std::byte, 4> invalidDepthBytes{};
     if (invalidBuilder.AddImmutableTexture2D("ForbiddenDepthUpload", 1, 1, sem::FormatMeaning::Depth32Float, 4, invalidDepthBytes)) return 23;
 
+    auto overlappingVertexLayout = graph;
+    auto overlappingRasterProgram = std::find_if(overlappingVertexLayout.programs.begin(), overlappingVertexLayout.programs.end(), [](const auto& program) {
+        return program.kind == sem::ProgramKind::Raster;
+    });
+    overlappingRasterProgram->interface.vertexInputs[0].componentCount = 4;
+    if (sge::analysis::Analyze(overlappingVertexLayout))
+    {
+        std::cerr << "overlapping vertex layout was accepted\n";
+        return 24;
+    }
+
+    auto unusedProgram = graph;
+    auto orphan = *rasterProgram;
+    orphan.id = {1000};
+    orphan.debugName = "UnusedProgram";
+    unusedProgram.programs.push_back(orphan);
+    if (sge::analysis::Analyze(unusedProgram))
+    {
+        std::cerr << "unused Program was accepted\n";
+        return 25;
+    }
+
+    auto missingTemporalPrevious = graph;
+    missingTemporalPrevious.works[computeWork.id.value].operands.erase(std::remove_if(
+        missingTemporalPrevious.works[computeWork.id.value].operands.begin(),
+        missingTemporalPrevious.works[computeWork.id.value].operands.end(), [](const auto& operand) {
+            return operand.kind == sem::WorkOperandKind::ProgramParameter && operand.parameter.value == 1;
+        }), missingTemporalPrevious.works[computeWork.id.value].operands.end());
+    missingTemporalPrevious.programs[computeProgram->id.value].interface.parameters.erase(
+        missingTemporalPrevious.programs[computeProgram->id.value].interface.parameters.begin() + 1);
+    missingTemporalPrevious.programs[computeProgram->id.value].interface.parameters[1].id = {1};
+    missingTemporalPrevious.works[computeWork.id.value].operands[1].parameter = {1};
+    if (sge::analysis::Analyze(missingTemporalPrevious))
+    {
+        std::cerr << "Temporal resource without a previous-generation reader was accepted\n";
+        return 26;
+    }
+
+    auto invalidSourceEntries = graph;
+    auto invalidRasterProgram = std::find_if(invalidSourceEntries.programs.begin(), invalidSourceEntries.programs.end(), [](const auto& program) {
+        return program.kind == sem::ProgramKind::Raster;
+    });
+    invalidRasterProgram->source.computeEntry = "CSMain";
+    if (sge::analysis::Analyze(invalidSourceEntries))
+    {
+        std::cerr << "raster Program with a compute entry was accepted\n";
+        return 27;
+    }
+
     sem::SemanticGraph empty;
-    if (sge::analysis::Analyze(empty)) return 24;
-    std::cout << "Generic operand, parameter identity, dependency, lifetime, alias, and resource-contract analysis tests passed.\n";
+    if (sge::analysis::Analyze(empty)) return 28;
+    std::cout << "Stage-E static completeness plus generic operand, parameter identity, dependency, lifetime, alias, and resource-contract analysis tests passed.\n";
     return 0;
 }

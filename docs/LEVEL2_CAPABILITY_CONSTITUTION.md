@@ -108,7 +108,7 @@ The capability vocabulary does not yet claim runtime qualification for:
 - multiple resources per external boundary contract
 - same-class multiple native queues
 - generated-graph qualification
-- shader reflection completeness
 
-Those are closed by later Level 2 stages. Stage C/D establishes the accepted
-input language and removes Slice-derived operand identities.
+Stage E closes shader-interface reflection and Compiler static-completeness.
+The remaining items are closed by later Level 2 stages. Stage C/D establishes
+the accepted input language and removes Slice-derived operand identities.

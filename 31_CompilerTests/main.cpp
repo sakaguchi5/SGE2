@@ -6,8 +6,10 @@
 #include "../20_ClassicalFrontend/ClassicalTriangle.h"
 
 #include <algorithm>
+#include <exception>
 #include <iostream>
 #include <map>
+#include <string>
 #include <string_view>
 
 namespace
@@ -106,6 +108,14 @@ sem::SemanticGraph AddIndependentCopy(sem::SemanticGraph graph)
     return graph;
 }
 
+bool ReplaceOnce(std::string& text, std::string_view before, std::string_view after)
+{
+    const auto position = text.find(before);
+    if (position == std::string::npos) return false;
+    text.replace(position, before.size(), after);
+    return true;
+}
+
 sem::SemanticGraph AddRasterBinding(sem::SemanticGraph graph)
 {
     const auto source = std::find_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
@@ -130,6 +140,13 @@ sem::SemanticGraph AddRasterBinding(sem::SemanticGraph graph)
     program->interface.parameters.push_back({parameterId, "GenericAdditionalRasterBinding",
         sem::ProgramParameterKind::ReadOnlyBuffer, sem::ShaderStage::Pixel, 5, 0, 1});
     raster->operands.push_back({sem::WorkOperandKind::ProgramParameter, use.id, parameterId});
+    if (!ReplaceOnce(program->source.hlslSource,
+            "SamplerState MainSampler : register(s0);",
+            "StructuredBuffer<float4> GenericAdditionalRasterBinding : register(t5);\nSamplerState MainSampler : register(s0);") ||
+        !ReplaceOnce(program->source.hlslSource,
+            " * ExternalColorInput[0];",
+            " * ExternalColorInput[0] * GenericAdditionalRasterBinding[0];"))
+        std::terminate();
     return graph;
 }
 
@@ -148,6 +165,29 @@ int main()
     const auto& graph = graphResult.Value();
     sge::target::D3D12TargetProfile profile;
 
+    auto validatedStage = sge::compiler::d3d12::ValidateSourceStage(graph, profile);
+    if (!validatedStage || validatedStage.Value().source != &graph ||
+        validatedStage.Value().analyzed.canonicalWorkOrder.size() != graph.works.size())
+        return 2;
+    auto programStage = sge::compiler::d3d12::CompileProgramStage(validatedStage.Value());
+    if (!programStage || programStage.Value().programs.size() != 2)
+    {
+        if (!programStage) std::cerr << programStage.Error().stage << ": " << programStage.Error().message << '\n';
+        return 3;
+    }
+    std::size_t reflectedShaderCount = 0;
+    std::size_t reflectedBindingCount = 0;
+    std::size_t reflectedVertexInputCount = 0;
+    for (const auto& program : programStage.Value().programs)
+        for (const auto& shader : program.shaders)
+        {
+            ++reflectedShaderCount;
+            reflectedBindingCount += shader.bindings.size();
+            reflectedVertexInputCount += shader.vertexInputs.size();
+        }
+    if (reflectedShaderCount != 3 || reflectedBindingCount != 10 || reflectedVertexInputCount != 3)
+        return 4;
+
     auto first = sge::compiler::d3d12::Compile(graph, profile);
     auto second = sge::compiler::d3d12::Compile(graph, profile);
     if (!first || !second)
@@ -156,9 +196,14 @@ int main()
         std::cerr << error.stage << ": " << error.message << '\n';
         return 2;
     }
+    const std::vector<std::string> expectedStages = {
+        "source-validation", "shader-compilation-reflection",
+        "package-lowering", "package-serialization-validation"};
+    if (first.Value().completedStages != expectedStages || second.Value().completedStages != expectedStages)
+        return 5;
     if (first.Value().packageBytes != second.Value().packageBytes ||
         first.Value().executionDigestHex != second.Value().executionDigestHex)
-        return 3;
+        return 6;
 
     auto sparse = RemapToSparseIds(graph);
     auto sparsePackage = sge::compiler::d3d12::Compile(sparse, profile);
@@ -362,6 +407,30 @@ int main()
     standalonePresent.works.push_back(presentWork);
     if (sge::compiler::d3d12::ValidateLevel2Capability(standalonePresent, profile)) return 36;
 
-    std::cout << "Level-2 capability rejection plus generic cardinality, dependency, lifetime, state, queue, allocation, operand binding, and Package lowering tests passed.\n";
+    auto registerMismatch = graph;
+    auto mismatchedRaster = std::find_if(registerMismatch.programs.begin(), registerMismatch.programs.end(), [](const auto& program) {
+        return program.kind == sem::ProgramKind::Raster;
+    });
+    mismatchedRaster->interface.parameters[1].shaderRegister = 7;
+    auto rejectedRegister = sge::compiler::d3d12::Compile(registerMismatch, profile);
+    if (rejectedRegister || rejectedRegister.Error().stage != "shader-reflection")
+    {
+        std::cerr << "ProgramInterface/HLSL register mismatch was not rejected by reflection\n";
+        return 37;
+    }
+
+    auto vertexMismatch = graph;
+    auto mismatchedVertexProgram = std::find_if(vertexMismatch.programs.begin(), vertexMismatch.programs.end(), [](const auto& program) {
+        return program.kind == sem::ProgramKind::Raster;
+    });
+    mismatchedVertexProgram->interface.vertexInputs[0].componentCount = 2;
+    auto rejectedVertex = sge::compiler::d3d12::Compile(vertexMismatch, profile);
+    if (rejectedVertex || rejectedVertex.Error().stage != "shader-reflection")
+    {
+        std::cerr << "ProgramInterface/HLSL vertex-input mismatch was not rejected by reflection\n";
+        return 38;
+    }
+
+    std::cout << "Stage-E typed pipeline, shader reflection, static completeness, capability rejection, and generic Package lowering tests passed.\n";
     return 0;
 }

@@ -11,6 +11,7 @@
 #endif
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <d3d11shader.h>
 #include <wrl/client.h>
 
 #ifdef interface
@@ -24,10 +25,14 @@
 #endif
 
 #include <algorithm>
+#include <bit>
+#include <cctype>
 #include <array>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -35,6 +40,7 @@
 
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxguid.lib")
 
 namespace sge::compiler::d3d12
 {
@@ -57,11 +63,217 @@ base::Result<T, CompileError> Failure(std::string stage, std::string message)
     return base::Result<T, CompileError>::Failure(Error(std::move(stage), std::move(message)));
 }
 
-base::Result<std::vector<std::byte>, CompileError> CompileShader(
-    const semantic::ProgramSource& source,
+std::string UpperAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char value) {
+        return static_cast<char>(std::toupper(value));
+    });
+    return value;
+}
+
+const char* StageName(semantic::ShaderStage stage) noexcept
+{
+    switch (stage)
+    {
+    case semantic::ShaderStage::Vertex: return "Vertex";
+    case semantic::ShaderStage::Pixel: return "Pixel";
+    case semantic::ShaderStage::Compute: return "Compute";
+    default: return "Unknown";
+    }
+}
+
+const char* ParameterKindName(semantic::ProgramParameterKind kind) noexcept
+{
+    switch (kind)
+    {
+    case semantic::ProgramParameterKind::ConstantBuffer: return "ConstantBuffer";
+    case semantic::ProgramParameterKind::SampledTexture: return "SampledTexture";
+    case semantic::ProgramParameterKind::ReadOnlyBuffer: return "ReadOnlyBuffer";
+    case semantic::ProgramParameterKind::UnorderedBuffer: return "UnorderedBuffer";
+    default: return "Unknown";
+    }
+}
+
+base::Result<ReflectedBindingKind, CompileError> ReflectedKind(
+    const D3D11_SHADER_INPUT_BIND_DESC& binding,
+    semantic::ShaderStage stage)
+{
+    switch (binding.Type)
+    {
+    case D3D_SIT_CBUFFER:
+        return base::Result<ReflectedBindingKind, CompileError>::Success(
+            ReflectedBindingKind::ConstantBuffer);
+    case D3D_SIT_TEXTURE:
+        if (binding.Dimension == D3D_SRV_DIMENSION_TEXTURE2D)
+            return base::Result<ReflectedBindingKind, CompileError>::Success(
+                ReflectedBindingKind::SampledTexture);
+        if (binding.Dimension == D3D_SRV_DIMENSION_BUFFER ||
+            binding.Dimension == D3D_SRV_DIMENSION_BUFFEREX)
+            return base::Result<ReflectedBindingKind, CompileError>::Success(
+                ReflectedBindingKind::ReadOnlyBuffer);
+        break;
+    case D3D_SIT_STRUCTURED:
+    case D3D_SIT_BYTEADDRESS:
+        return base::Result<ReflectedBindingKind, CompileError>::Success(
+            ReflectedBindingKind::ReadOnlyBuffer);
+    case D3D_SIT_UAV_RWTYPED:
+        if (binding.Dimension == D3D_SRV_DIMENSION_BUFFER ||
+            binding.Dimension == D3D_SRV_DIMENSION_BUFFEREX)
+            return base::Result<ReflectedBindingKind, CompileError>::Success(
+                ReflectedBindingKind::UnorderedBuffer);
+        break;
+    case D3D_SIT_UAV_RWSTRUCTURED:
+    case D3D_SIT_UAV_RWBYTEADDRESS:
+    case D3D_SIT_UAV_APPEND_STRUCTURED:
+    case D3D_SIT_UAV_CONSUME_STRUCTURED:
+    case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+        return base::Result<ReflectedBindingKind, CompileError>::Success(
+            ReflectedBindingKind::UnorderedBuffer);
+    case D3D_SIT_SAMPLER:
+        return base::Result<ReflectedBindingKind, CompileError>::Success(
+            ReflectedBindingKind::StaticSampler);
+    default:
+        break;
+    }
+    std::ostringstream message;
+    message << StageName(stage) << " shader contains an unsupported reflected resource type at register "
+            << binding.BindPoint;
+    return Failure<ReflectedBindingKind>("shader-reflection", message.str());
+}
+
+base::Result<semantic::VertexInput::Meaning, CompileError> VertexMeaning(
+    const D3D11_SIGNATURE_PARAMETER_DESC& input)
+{
+    const auto semanticName = UpperAscii(input.SemanticName ? input.SemanticName : "");
+    if (semanticName == "POSITION")
+        return base::Result<semantic::VertexInput::Meaning, CompileError>::Success(
+            semantic::VertexInput::Meaning::Position);
+    if (semanticName == "COLOR")
+        return base::Result<semantic::VertexInput::Meaning, CompileError>::Success(
+            semantic::VertexInput::Meaning::Color);
+    if (semanticName == "TEXCOORD")
+        return base::Result<semantic::VertexInput::Meaning, CompileError>::Success(
+            semantic::VertexInput::Meaning::TexCoord);
+    return Failure<semantic::VertexInput::Meaning>(
+        "shader-reflection", "Vertex shader contains an unsupported input semantic: " + semanticName);
+}
+
+std::optional<semantic::ProgramParameterKind> SemanticKind(ReflectedBindingKind kind) noexcept
+{
+    switch (kind)
+    {
+    case ReflectedBindingKind::ConstantBuffer:
+        return semantic::ProgramParameterKind::ConstantBuffer;
+    case ReflectedBindingKind::SampledTexture:
+        return semantic::ProgramParameterKind::SampledTexture;
+    case ReflectedBindingKind::ReadOnlyBuffer:
+        return semantic::ProgramParameterKind::ReadOnlyBuffer;
+    case ReflectedBindingKind::UnorderedBuffer:
+        return semantic::ProgramParameterKind::UnorderedBuffer;
+    default:
+        return std::nullopt;
+    }
+}
+
+base::Result<void, CompileError> ValidateReflectedInterface(
+    const semantic::Program& program,
+    const CompiledShaderStage& shader)
+{
+    std::map<std::pair<std::uint16_t, std::uint32_t>, const semantic::ProgramParameter*> expected;
+    bool expectsStaticSampler = false;
+    for (const auto& parameter : program.interface.parameters)
+    {
+        if (parameter.stage != shader.stage) continue;
+        expected[{static_cast<std::uint16_t>(parameter.kind), parameter.shaderRegister}] = &parameter;
+        if (parameter.kind == semantic::ProgramParameterKind::SampledTexture)
+            expectsStaticSampler = true;
+    }
+
+    std::set<std::pair<std::uint16_t, std::uint32_t>> reflected;
+    std::uint32_t samplerCount = 0;
+    for (const auto& binding : shader.bindings)
+    {
+        if (binding.kind == ReflectedBindingKind::StaticSampler)
+        {
+            ++samplerCount;
+            if (shader.stage != semantic::ShaderStage::Pixel || binding.shaderRegister != 0 ||
+                binding.bindCount != 1)
+                return Failure<void>("shader-reflection",
+                    "Level 2 v1 requires the reflected static sampler to be Pixel s0 with bind count 1");
+            continue;
+        }
+        const auto semanticKind = SemanticKind(binding.kind);
+        if (!semanticKind)
+            return Failure<void>("shader-reflection", "reflected binding cannot map to a ProgramParameter");
+        const auto key = std::pair{static_cast<std::uint16_t>(*semanticKind), binding.shaderRegister};
+        if (!reflected.insert(key).second)
+            return Failure<void>("shader-reflection", "shader reflection contains a duplicate binding");
+        const auto found = expected.find(key);
+        if (found == expected.end())
+        {
+            std::ostringstream message;
+            message << StageName(shader.stage) << " shader declares " << ParameterKindName(*semanticKind)
+                    << " register " << binding.shaderRegister
+                    << " that is absent from ProgramInterface";
+            return Failure<void>("shader-reflection", message.str());
+        }
+        if (binding.bindCount != 1)
+            return Failure<void>("shader-reflection", "Level 2 v1 does not support shader binding arrays");
+        if (*semanticKind == semantic::ProgramParameterKind::ConstantBuffer &&
+            binding.requiredBytes != found->second->requiredBytes)
+        {
+            std::ostringstream message;
+            message << StageName(shader.stage) << " constant buffer b" << binding.shaderRegister
+                    << " reflects " << binding.requiredBytes << " bytes but ProgramInterface requires "
+                    << found->second->requiredBytes;
+            return Failure<void>("shader-reflection", message.str());
+        }
+    }
+    if (reflected.size() != expected.size())
+    {
+        for (const auto& [key, parameter] : expected)
+            if (!reflected.contains(key))
+            {
+                std::ostringstream message;
+                message << StageName(shader.stage) << " ProgramInterface parameter "
+                        << parameter->debugName << " at register " << parameter->shaderRegister
+                        << " is absent from reflected shader bindings";
+                return Failure<void>("shader-reflection", message.str());
+            }
+    }
+    if ((expectsStaticSampler && samplerCount != 1) || (!expectsStaticSampler && samplerCount != 0))
+        return Failure<void>("shader-reflection",
+            "reflected sampler contract does not match sampled-texture ProgramParameters");
+
+    if (shader.stage == semantic::ShaderStage::Vertex)
+    {
+        if (shader.vertexInputs.size() != program.interface.vertexInputs.size())
+            return Failure<void>("shader-reflection",
+                "Vertex shader input count does not match ProgramInterface");
+        std::map<semantic::VertexInput::Meaning, std::uint16_t> expectedInputs;
+        for (const auto& input : program.interface.vertexInputs)
+            expectedInputs[input.meaning] = input.componentCount;
+        for (const auto& reflectedInput : shader.vertexInputs)
+        {
+            const auto found = expectedInputs.find(reflectedInput.meaning);
+            if (found == expectedInputs.end() || found->second != reflectedInput.componentCount ||
+                reflectedInput.semanticIndex != 0)
+                return Failure<void>("shader-reflection",
+                    "Vertex shader input semantic/components do not match ProgramInterface");
+        }
+    }
+    else if (!shader.vertexInputs.empty())
+    {
+        return Failure<void>("shader-reflection", "non-Vertex shader unexpectedly reflects vertex inputs");
+    }
+    return base::Result<void, CompileError>::Success();
+}
+
+base::Result<CompiledShaderStage, CompileError> CompileAndReflectShader(
+    const semantic::Program& program,
+    semantic::ShaderStage shaderStage,
     const std::string& entry,
-    const char* profile,
-    const char* stage)
+    const char* profile)
 {
     ComPtr<ID3DBlob> shader;
     ComPtr<ID3DBlob> errors;
@@ -69,15 +281,74 @@ base::Result<std::vector<std::byte>, CompileError> CompileShader(
                            D3DCOMPILE_WARNINGS_ARE_ERRORS |
                            D3DCOMPILE_OPTIMIZATION_LEVEL3;
     const HRESULT result = D3DCompile(
-        source.hlslSource.data(), source.hlslSource.size(), nullptr, nullptr, nullptr,
+        program.source.hlslSource.data(), program.source.hlslSource.size(), nullptr, nullptr, nullptr,
         entry.c_str(), profile, flags, 0, &shader, &errors);
     if (FAILED(result))
     {
         std::string message = "D3DCompile failed";
         if (errors)
             message.assign(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
-        return Failure<std::vector<std::byte>>(stage, std::move(message));
+        return Failure<CompiledShaderStage>("shader-compilation", std::move(message));
     }
+
+    ComPtr<ID3D11ShaderReflection> reflection;
+    const HRESULT reflectionResult = D3DReflect(
+        shader->GetBufferPointer(), shader->GetBufferSize(), IID_ID3D11ShaderReflection,
+        reinterpret_cast<void**>(reflection.GetAddressOf()));
+    if (FAILED(reflectionResult) || !reflection)
+        return Failure<CompiledShaderStage>("shader-reflection", "D3DReflect failed");
+
+    D3D11_SHADER_DESC shaderDescription{};
+    if (FAILED(reflection->GetDesc(&shaderDescription)))
+        return Failure<CompiledShaderStage>("shader-reflection", "ID3D11ShaderReflection::GetDesc failed");
+
+    CompiledShaderStage output;
+    output.stage = shaderStage;
+    for (UINT index = 0; index < shaderDescription.BoundResources; ++index)
+    {
+        D3D11_SHADER_INPUT_BIND_DESC binding{};
+        if (FAILED(reflection->GetResourceBindingDesc(index, &binding)))
+            return Failure<CompiledShaderStage>("shader-reflection", "GetResourceBindingDesc failed");
+        auto kind = ReflectedKind(binding, shaderStage);
+        if (!kind) return base::Result<CompiledShaderStage, CompileError>::Failure(kind.Error());
+        ReflectedBinding reflectedBinding;
+        reflectedBinding.kind = kind.Value();
+        reflectedBinding.stage = shaderStage;
+        reflectedBinding.shaderRegister = binding.BindPoint;
+        reflectedBinding.bindCount = binding.BindCount;
+        if (binding.Type == D3D_SIT_CBUFFER)
+        {
+            auto* constantBuffer = reflection->GetConstantBufferByName(binding.Name);
+            D3D11_SHADER_BUFFER_DESC bufferDescription{};
+            if (constantBuffer == nullptr || FAILED(constantBuffer->GetDesc(&bufferDescription)))
+                return Failure<CompiledShaderStage>("shader-reflection", "constant-buffer reflection failed");
+            reflectedBinding.requiredBytes = bufferDescription.Size;
+        }
+        output.bindings.push_back(reflectedBinding);
+    }
+    std::sort(output.bindings.begin(), output.bindings.end(), [](const auto& left, const auto& right) {
+        return std::tuple{left.kind, left.shaderRegister} < std::tuple{right.kind, right.shaderRegister};
+    });
+
+    if (shaderStage == semantic::ShaderStage::Vertex)
+    {
+        for (UINT index = 0; index < shaderDescription.InputParameters; ++index)
+        {
+            D3D11_SIGNATURE_PARAMETER_DESC input{};
+            if (FAILED(reflection->GetInputParameterDesc(index, &input)))
+                return Failure<CompiledShaderStage>("shader-reflection", "GetInputParameterDesc failed");
+            if (input.SystemValueType != D3D_NAME_UNDEFINED) continue;
+            auto meaning = VertexMeaning(input);
+            if (!meaning) return base::Result<CompiledShaderStage, CompileError>::Failure(meaning.Error());
+            output.vertexInputs.push_back({meaning.Value(),
+                static_cast<std::uint16_t>(std::popcount(static_cast<unsigned int>(input.Mask & 0x0f))),
+                static_cast<std::uint16_t>(input.SemanticIndex)});
+        }
+    }
+
+    auto interfaceValidation = ValidateReflectedInterface(program, output);
+    if (!interfaceValidation)
+        return base::Result<CompiledShaderStage, CompileError>::Failure(interfaceValidation.Error());
 
     ComPtr<ID3DBlob> stripped;
     constexpr UINT stripFlags = D3DCOMPILER_STRIP_REFLECTION_DATA |
@@ -85,10 +356,10 @@ base::Result<std::vector<std::byte>, CompileError> CompileShader(
                                 D3DCOMPILER_STRIP_TEST_BLOBS |
                                 D3DCOMPILER_STRIP_PRIVATE_DATA;
     if (FAILED(D3DStripShader(shader->GetBufferPointer(), shader->GetBufferSize(), stripFlags, &stripped)))
-        return Failure<std::vector<std::byte>>(stage, "D3DStripShader failed");
+        return Failure<CompiledShaderStage>("shader-compilation", "D3DStripShader failed");
     const auto* begin = static_cast<const std::byte*>(stripped->GetBufferPointer());
-    return base::Result<std::vector<std::byte>, CompileError>::Success(
-        std::vector<std::byte>(begin, begin + stripped->GetBufferSize()));
+    output.bytecode.assign(begin, begin + stripped->GetBufferSize());
+    return base::Result<CompiledShaderStage, CompileError>::Success(std::move(output));
 }
 
 base::Result<std::vector<std::byte>, CompileError> SerializeRootSignature(
@@ -323,12 +594,6 @@ pkg::ResourceState RequiredState(semantic::ViewRole role, semantic::WorkKind wor
     }
 }
 
-bool IsShaderResource(semantic::ViewRole role)
-{
-    return role == semantic::ViewRole::SampledTexture ||
-           role == semantic::ViewRole::ShaderBuffer;
-}
-
 bool DescriptorBacked(pkg::ViewClass viewClass)
 {
     return viewClass == pkg::ViewClass::ShaderResource ||
@@ -372,6 +637,12 @@ struct StateCell final
     std::uint32_t temporalRelation = 0; // 0 normal, 1 current, 2 previous
     auto operator<=>(const StateCell&) const = default;
 };
+
+struct LoweredPackageStage final
+{
+    pkg::D3D12PackageDescription description;
+};
+
 }
 
 base::Result<void, CompileError> ValidateLevel2Capability(
@@ -436,7 +707,7 @@ base::Result<void, CompileError> ValidateLevel2Capability(
     return base::Result<void, CompileError>::Success();
 }
 
-base::Result<CompileOutput, CompileError> Compile(
+base::Result<ValidatedSourceStage, CompileError> ValidateSourceStage(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile)
 {
@@ -449,13 +720,79 @@ base::Result<CompileOutput, CompileError> Compile(
             if (!message.empty()) message += "; ";
             message += diagnostic.message;
         }
-        return Failure<CompileOutput>("semantic-analysis", std::move(message));
+        return Failure<ValidatedSourceStage>("semantic-analysis", std::move(message));
     }
-    const auto& analyzed = analyzedResult.Value();
-
     auto capability = ValidateLevel2Capability(graph, targetProfile);
     if (!capability)
-        return base::Result<CompileOutput, CompileError>::Failure(capability.Error());
+        return base::Result<ValidatedSourceStage, CompileError>::Failure(capability.Error());
+
+    ValidatedSourceStage output;
+    output.source = &graph;
+    output.targetProfile = targetProfile;
+    output.analyzed = std::move(analyzedResult).Value();
+    return base::Result<ValidatedSourceStage, CompileError>::Success(std::move(output));
+}
+
+base::Result<ProgramCompilationStage, CompileError> CompileProgramStage(
+    const ValidatedSourceStage& validated)
+{
+    if (validated.source == nullptr || validated.analyzed.source != validated.source)
+        return Failure<ProgramCompilationStage>("shader-compilation", "validated source stage is detached from its SemanticGraph");
+
+    std::map<std::uint32_t, const semantic::Program*> programs;
+    for (const auto& program : validated.source->programs)
+        programs[program.id.value] = &program;
+    std::set<std::uint32_t> usedProgramIds;
+    for (const auto& work : validated.source->works)
+    {
+        if (work.kind == semantic::WorkKind::Raster) usedProgramIds.insert(work.raster.program.value);
+        if (work.kind == semantic::WorkKind::Compute) usedProgramIds.insert(work.compute.program.value);
+    }
+
+    ProgramCompilationStage output;
+    for (const auto programId : validated.analyzed.canonicalProgramOrder)
+    {
+        if (!usedProgramIds.contains(programId.value)) continue;
+        const auto found = programs.find(programId.value);
+        if (found == programs.end())
+            return Failure<ProgramCompilationStage>("shader-compilation", "canonical Program is missing from the validated source");
+        const auto& program = *found->second;
+        CompiledProgram compiled;
+        compiled.sourceProgram = program.id;
+        if (program.kind == semantic::ProgramKind::Raster)
+        {
+            auto vertex = CompileAndReflectShader(
+                program, semantic::ShaderStage::Vertex, program.source.vertexEntry, "vs_5_1");
+            if (!vertex) return base::Result<ProgramCompilationStage, CompileError>::Failure(vertex.Error());
+            auto pixel = CompileAndReflectShader(
+                program, semantic::ShaderStage::Pixel, program.source.pixelEntry, "ps_5_1");
+            if (!pixel) return base::Result<ProgramCompilationStage, CompileError>::Failure(pixel.Error());
+            compiled.shaders.push_back(std::move(vertex).Value());
+            compiled.shaders.push_back(std::move(pixel).Value());
+        }
+        else
+        {
+            auto compute = CompileAndReflectShader(
+                program, semantic::ShaderStage::Compute, program.source.computeEntry, "cs_5_1");
+            if (!compute) return base::Result<ProgramCompilationStage, CompileError>::Failure(compute.Error());
+            compiled.shaders.push_back(std::move(compute).Value());
+        }
+        output.programs.push_back(std::move(compiled));
+    }
+    return base::Result<ProgramCompilationStage, CompileError>::Success(std::move(output));
+}
+
+namespace
+{
+base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
+    const ValidatedSourceStage& validated,
+    const ProgramCompilationStage& compiledPrograms)
+{
+    if (validated.source == nullptr)
+        return Failure<LoweredPackageStage>("package-lowering", "validated source stage has no SemanticGraph");
+    const auto& graph = *validated.source;
+    const auto& targetProfile = validated.targetProfile;
+    const auto& analyzed = validated.analyzed;
 
     std::map<std::uint32_t, const semantic::Resource*> resources;
     std::map<std::uint32_t, const semantic::ResourceUse*> uses;
@@ -634,7 +971,7 @@ base::Result<CompileOutput, CompileError> Compile(
     if (rtvDescriptors > targetProfile.rtvDescriptorCount ||
         dsvDescriptors > targetProfile.dsvDescriptorCount ||
         shaderDescriptors > targetProfile.shaderDescriptorCount)
-        return Failure<CompileOutput>("descriptor-planning", "generated descriptor plan exceeds the target profile");
+        return Failure<LoweredPackageStage>("descriptor-planning", "generated descriptor plan exceeds the target profile");
 
     std::map<std::uint32_t, pkg::DynamicSlotId> dynamicSlots;
     std::map<std::uint32_t, pkg::ExternalSlotId> externalSlots;
@@ -701,7 +1038,7 @@ base::Result<CompileOutput, CompileError> Compile(
             preparationLifetime.lastUse < targetLifetime.firstUse ||
             targetLifetime.lastUse < preparationLifetime.firstUse;
         if (!nonOverlapping)
-            return Failure<CompileOutput>("allocation-planning", "explicit alias Resource lifetimes overlap");
+            return Failure<LoweredPackageStage>("allocation-planning", "explicit alias Resource lifetimes overlap");
         aliasPairs[preparation.id.value] = targetResource.id.value;
     }
 
@@ -745,7 +1082,7 @@ base::Result<CompileOutput, CompileError> Compile(
         {
             const auto partnerPackage = resourceMap.at(partnerId);
             if (description.resources[partnerPackage.value].physicalInstanceCount != allocation.physicalInstanceCount)
-                return Failure<CompileOutput>("allocation-planning", "alias candidates have incompatible physical instance counts");
+                return Failure<LoweredPackageStage>("allocation-planning", "alias candidates have incompatible physical instance counts");
             allocationForResource[partnerId] = allocation.id;
             description.resources[partnerPackage.value].allocation = allocation.id;
             description.resources[packageResource.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
@@ -754,46 +1091,41 @@ base::Result<CompileOutput, CompileError> Compile(
         }
     }
 
-    std::set<std::uint32_t> usedProgramIds;
-    for (const auto& work : graph.works)
-    {
-        if (work.kind == semantic::WorkKind::Raster) usedProgramIds.insert(work.raster.program.value);
-        if (work.kind == semantic::WorkKind::Compute) usedProgramIds.insert(work.compute.program.value);
-    }
     std::map<std::uint32_t, ShaderIds> shaderMap;
-    for (const auto programId : analyzed.canonicalProgramOrder)
+    for (const auto& compiledProgram : compiledPrograms.programs)
     {
-        if (!usedProgramIds.contains(programId.value)) continue;
-        const auto& source = *programs.at(programId.value);
         ShaderIds ids;
-        if (source.kind == semantic::ProgramKind::Raster)
+        for (const auto& shader : compiledProgram.shaders)
         {
-            auto vertex = CompileShader(source.source, source.source.vertexEntry, "vs_5_1", "vertex-shader");
-            if (!vertex) return base::Result<CompileOutput, CompileError>::Failure(vertex.Error());
-            auto pixel = CompileShader(source.source, source.source.pixelEntry, "ps_5_1", "pixel-shader");
-            if (!pixel) return base::Result<CompileOutput, CompileError>::Failure(pixel.Error());
-            ids.vertex = {static_cast<std::uint32_t>(description.shaders.size())};
-            const auto vertexOffset = AppendAligned(description.shaderData, vertex.Value());
-            description.shaders.push_back({ids.vertex, pkg::ShaderStage::Vertex, pkg::ShaderBinaryFormat::Dxbc,
+            pkg::ShaderStage packageStage{};
+            pkg::ShaderId* destination = nullptr;
+            if (shader.stage == semantic::ShaderStage::Vertex)
+            {
+                packageStage = pkg::ShaderStage::Vertex;
+                destination = &ids.vertex;
+            }
+            else if (shader.stage == semantic::ShaderStage::Pixel)
+            {
+                packageStage = pkg::ShaderStage::Pixel;
+                destination = &ids.pixel;
+            }
+            else if (shader.stage == semantic::ShaderStage::Compute)
+            {
+                packageStage = pkg::ShaderStage::Compute;
+                destination = &ids.compute;
+            }
+            else
+            {
+                return Failure<LoweredPackageStage>("package-lowering", "compiled shader stage is unknown");
+            }
+            *destination = {static_cast<std::uint32_t>(description.shaders.size())};
+            const auto offset = AppendAligned(description.shaderData, shader.bytecode);
+            description.shaders.push_back({*destination, packageStage, pkg::ShaderBinaryFormat::Dxbc,
                 targetProfile.shaderModelMajor, targetProfile.shaderModelMinor, 0,
-                {package::SectionKind::ShaderData, 0, vertexOffset, vertex.Value().size()}, base::Sha256(vertex.Value())});
-            ids.pixel = {static_cast<std::uint32_t>(description.shaders.size())};
-            const auto pixelOffset = AppendAligned(description.shaderData, pixel.Value());
-            description.shaders.push_back({ids.pixel, pkg::ShaderStage::Pixel, pkg::ShaderBinaryFormat::Dxbc,
-                targetProfile.shaderModelMajor, targetProfile.shaderModelMinor, 0,
-                {package::SectionKind::ShaderData, 0, pixelOffset, pixel.Value().size()}, base::Sha256(pixel.Value())});
+                {package::SectionKind::ShaderData, 0, offset, shader.bytecode.size()},
+                base::Sha256(shader.bytecode)});
         }
-        else
-        {
-            auto compute = CompileShader(source.source, source.source.computeEntry, "cs_5_1", "compute-shader");
-            if (!compute) return base::Result<CompileOutput, CompileError>::Failure(compute.Error());
-            ids.compute = {static_cast<std::uint32_t>(description.shaders.size())};
-            const auto computeOffset = AppendAligned(description.shaderData, compute.Value());
-            description.shaders.push_back({ids.compute, pkg::ShaderStage::Compute, pkg::ShaderBinaryFormat::Dxbc,
-                targetProfile.shaderModelMajor, targetProfile.shaderModelMinor, 0,
-                {package::SectionKind::ShaderData, 0, computeOffset, compute.Value().size()}, base::Sha256(compute.Value())});
-        }
-        shaderMap[source.id.value] = ids;
+        shaderMap[compiledProgram.sourceProgram.value] = ids;
     }
 
     std::map<std::uint32_t, WorkArtifacts> workArtifacts;
@@ -825,7 +1157,7 @@ base::Result<CompileOutput, CompileError> Compile(
                        semantic::ProgramParameterKind::ConstantBuffer;
             }));
         if (rootCost > 64)
-            return Failure<CompileOutput>("binding-layout", "root signature exceeds the D3D12 64-DWORD limit");
+            return Failure<LoweredPackageStage>("binding-layout", "root signature exceeds the D3D12 64-DWORD limit");
 
         const pkg::BindingLayoutId layoutId{static_cast<std::uint32_t>(description.bindingLayouts.size())};
         const auto parameterFirst = static_cast<std::uint32_t>(description.rootParameters.size());
@@ -868,14 +1200,14 @@ base::Result<CompileOutput, CompileError> Compile(
                 ++descriptorCount;
                 break;
             default:
-                return Failure<CompileOutput>("binding-layout", "ProgramParameter kind is unsupported");
+                return Failure<LoweredPackageStage>("binding-layout", "ProgramParameter kind is unsupported");
             }
             description.rootParameters.push_back(parameter);
         }
 
         auto rootBytes = SerializeBindingLayout(nativeBindings,
             work.kind == semantic::WorkKind::Raster, hasStaticSampler);
-        if (!rootBytes) return base::Result<CompileOutput, CompileError>::Failure(rootBytes.Error());
+        if (!rootBytes) return base::Result<LoweredPackageStage, CompileError>::Failure(rootBytes.Error());
         const auto rootOffset = AppendAligned(description.nativeObjectData, rootBytes.Value());
         pkg::BindingLayoutArtifact layout;
         layout.id = layoutId;
@@ -1198,7 +1530,7 @@ base::Result<CompileOutput, CompileError> Compile(
             const auto required = RequiredState(use->role, work.kind);
             const auto existing = activeUses.find(cell);
             if (existing != activeUses.end() && RequiredState(existing->second->role, work.kind) != required)
-                return Failure<CompileOutput>("state-planning", "one Work requires incompatible states for the same state cell");
+                return Failure<LoweredPackageStage>("state-planning", "one Work requires incompatible states for the same state cell");
             activeUses[cell] = use;
             emitTransition(queue, viewMap.at(use->id.value), cell, required);
         }
@@ -1215,7 +1547,7 @@ base::Result<CompileOutput, CompileError> Compile(
                     destinationUse = uses.at(operand.use.value);
             }
             if (sourceUse == nullptr || destinationUse == nullptr)
-                return Failure<CompileOutput>("operation-lowering", "validated Copy Work has missing operands");
+                return Failure<LoweredPackageStage>("operation-lowering", "validated Copy Work has missing operands");
             addOperation(pkg::D3D12OperationCode::ExecuteCopy, queue,
                 pkg::Encode(pkg::CopyBufferPayload{resourceMap.at(sourceUse->resource.value),
                     resourceMap.at(destinationUse->resource.value), 0, 0, work.copy.bytes}));
@@ -1277,7 +1609,14 @@ base::Result<CompileOutput, CompileError> Compile(
     description.operationStreams.push_back({pkg::OperationStreamKind::Frame, loadCount,
         static_cast<std::uint32_t>(description.operations.size()) - loadCount, 0});
 
-    auto packageBytes = pkg::BuildFrozenPackage(description);
+    LoweredPackageStage output;
+    output.description = std::move(description);
+    return base::Result<LoweredPackageStage, CompileError>::Success(std::move(output));
+}
+
+base::Result<CompileOutput, CompileError> FreezePackageStage(LoweredPackageStage lowered)
+{
+    auto packageBytes = pkg::BuildFrozenPackage(lowered.description);
     if (!packageBytes)
         return Failure<CompileOutput>("package-serialization", packageBytes.Error().message);
     auto verified = package::PackageReader::Read(packageBytes.Value());
@@ -1291,5 +1630,30 @@ base::Result<CompileOutput, CompileError> Compile(
     output.executionDigestHex = base::ToHex(verified.Value().ExecutionDigest());
     output.packageBytes = std::move(packageBytes).Value();
     return base::Result<CompileOutput, CompileError>::Success(std::move(output));
+}
+}
+
+base::Result<CompileOutput, CompileError> Compile(
+    const semantic::SemanticGraph& graph,
+    const target::D3D12TargetProfile& targetProfile)
+{
+    auto validated = ValidateSourceStage(graph, targetProfile);
+    if (!validated)
+        return base::Result<CompileOutput, CompileError>::Failure(validated.Error());
+    auto programs = CompileProgramStage(validated.Value());
+    if (!programs)
+        return base::Result<CompileOutput, CompileError>::Failure(programs.Error());
+    auto lowered = LowerPackageStage(validated.Value(), programs.Value());
+    if (!lowered)
+        return base::Result<CompileOutput, CompileError>::Failure(lowered.Error());
+    auto frozen = FreezePackageStage(std::move(lowered).Value());
+    if (!frozen)
+        return frozen;
+    frozen.Value().completedStages = {
+        "source-validation",
+        "shader-compilation-reflection",
+        "package-lowering",
+        "package-serialization-validation"};
+    return frozen;
 }
 }

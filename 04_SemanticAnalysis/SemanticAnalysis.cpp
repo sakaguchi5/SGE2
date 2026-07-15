@@ -108,6 +108,8 @@ void ValidateResource(const Resource& resource, std::uint32_t source,
         {
         case UpdateIntent::Immutable:
             if (resource.buffer.strideBytes == 0 ||
+                resource.buffer.strideBytes > resource.buffer.sizeBytes ||
+                resource.buffer.sizeBytes % resource.buffer.strideBytes != 0 ||
                 resource.initialContent.size() != resource.buffer.sizeBytes)
                 Push(diagnostics, "immutable buffer contract is incomplete", source);
             if (resource.lifetime != LifetimeIntent::Persistent &&
@@ -118,7 +120,8 @@ void ValidateResource(const Resource& resource, std::uint32_t source,
             if (resource.lifetime != LifetimeIntent::FrameLocal ||
                 !resource.initialContent.empty() ||
                 resource.dynamicData.requiredBytes != resource.buffer.sizeBytes ||
-                !base::IsPowerOfTwo(resource.dynamicData.requiredAlignment))
+                !base::IsPowerOfTwo(resource.dynamicData.requiredAlignment) ||
+                resource.dynamicData.requiredAlignment > 256)
                 Push(diagnostics, "dynamic buffer contract is incomplete", source);
             break;
         case UpdateIntent::GpuWritten:
@@ -161,8 +164,9 @@ void ValidateResource(const Resource& resource, std::uint32_t source,
         {
             const auto required = static_cast<std::uint64_t>(resource.texture2D.rowBytes) *
                                   resource.texture2D.height;
+            const auto minimumRowBytes = static_cast<std::uint64_t>(resource.texture2D.width) * 4u;
             if (resource.lifetime != LifetimeIntent::Persistent ||
-                resource.texture2D.rowBytes == 0 || required != resource.initialContent.size())
+                resource.texture2D.rowBytes < minimumRowBytes || required != resource.initialContent.size())
                 Push(diagnostics, "immutable Texture2D contract is incomplete", source);
         }
         else if (resource.update == UpdateIntent::GpuWritten)
@@ -184,7 +188,7 @@ void ValidateResource(const Resource& resource, std::uint32_t source,
         if (resource.lifetime != LifetimeIntent::External ||
             resource.update != UpdateIntent::External ||
             resource.visibility != Visibility::Published ||
-            resource.surface.formatMeaning == FormatMeaning::Unknown ||
+            resource.surface.formatMeaning != FormatMeaning::Bgra8Unorm ||
             !resource.initialContent.empty())
             Push(diagnostics, "surface contract is incomplete", source);
         return;
@@ -202,7 +206,8 @@ void ValidateProgram(const Program& program, std::uint32_t source,
             program.interface.vertexStrideBytes == 0 ||
             program.source.hlslSource.empty() ||
             program.source.vertexEntry.empty() ||
-            program.source.pixelEntry.empty())
+            program.source.pixelEntry.empty() ||
+            !program.source.computeEntry.empty())
             Push(diagnostics, "raster program contract is incomplete", source);
     }
     else if (program.kind == ProgramKind::Compute)
@@ -210,6 +215,8 @@ void ValidateProgram(const Program& program, std::uint32_t source,
         if (!program.interface.vertexInputs.empty() ||
             program.interface.vertexStrideBytes != 0 ||
             program.source.hlslSource.empty() ||
+            !program.source.vertexEntry.empty() ||
+            !program.source.pixelEntry.empty() ||
             program.source.computeEntry.empty())
             Push(diagnostics, "compute program contract is incomplete", source);
     }
@@ -218,7 +225,29 @@ void ValidateProgram(const Program& program, std::uint32_t source,
         Push(diagnostics, "program kind is unknown", source);
     }
 
-    std::set<std::pair<std::uint16_t, std::uint32_t>> registerKeys;
+    if (program.kind == ProgramKind::Raster)
+    {
+        std::set<VertexInput::Meaning> meanings;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+        std::uint32_t requiredStride = 0;
+        for (const auto& input : program.interface.vertexInputs)
+        {
+            if (input.componentCount == 0 || input.componentCount > 4 ||
+                input.byteOffset % 4 != 0 || !meanings.insert(input.meaning).second)
+                Push(diagnostics, "vertex input declaration is invalid or duplicated", source);
+            const auto end = input.byteOffset + static_cast<std::uint32_t>(input.componentCount) * 4u;
+            for (const auto& [otherBegin, otherEnd] : ranges)
+                if (input.byteOffset < otherEnd && otherBegin < end)
+                    Push(diagnostics, "vertex input byte ranges overlap", source);
+            ranges.push_back({input.byteOffset, end});
+            requiredStride = std::max(requiredStride, end);
+        }
+        if (requiredStride > program.interface.vertexStrideBytes ||
+            program.interface.vertexStrideBytes % 4 != 0)
+            Push(diagnostics, "vertex input layout exceeds or misaligns vertexStrideBytes", source);
+    }
+
+    std::set<std::tuple<std::uint16_t, std::uint16_t, std::uint32_t>> registerKeys;
     for (std::size_t index = 0; index < program.interface.parameters.size(); ++index)
     {
         const auto& parameter = program.interface.parameters[index];
@@ -235,30 +264,37 @@ void ValidateProgram(const Program& program, std::uint32_t source,
         {
         case ProgramParameterKind::ConstantBuffer:
             registerClass = 1;
-            if (parameter.requiredBytes == 0 || !base::IsPowerOfTwo(parameter.requiredAlignment))
-                Push(diagnostics, "constant-buffer parameter requires bytes and power-of-two alignment", source);
+            if (parameter.requiredBytes == 0 || parameter.requiredBytes % 16 != 0 ||
+                !base::IsPowerOfTwo(parameter.requiredAlignment) ||
+                parameter.requiredAlignment > 256)
+                Push(diagnostics, "constant-buffer parameter requires 16-byte-sized data and a supported power-of-two alignment", source);
             break;
         case ProgramParameterKind::SampledTexture:
             registerClass = 2;
-            if (parameter.stage != ShaderStage::Pixel || parameter.requiredBytes != 0)
+            if (parameter.stage != ShaderStage::Pixel || parameter.requiredBytes != 0 ||
+                parameter.requiredAlignment != 1)
                 Push(diagnostics, "sampled-texture parameter must be a Pixel-stage texture", source);
             break;
         case ProgramParameterKind::ReadOnlyBuffer:
             registerClass = 2;
-            if (parameter.stage == ShaderStage::Vertex || parameter.requiredBytes != 0)
+            if (parameter.stage == ShaderStage::Vertex || parameter.requiredBytes != 0 ||
+                parameter.requiredAlignment != 1)
                 Push(diagnostics, "read-only-buffer parameter must be Pixel or Compute stage", source);
             break;
         case ProgramParameterKind::UnorderedBuffer:
             registerClass = 3;
-            if (parameter.stage != ShaderStage::Compute || parameter.requiredBytes != 0)
+            if (parameter.stage != ShaderStage::Compute || parameter.requiredBytes != 0 ||
+                parameter.requiredAlignment != 1)
                 Push(diagnostics, "unordered-buffer parameter is limited to Compute stage in Level 2 v1", source);
             break;
         default:
             Push(diagnostics, "ProgramParameter kind is unknown", source);
             break;
         }
-        if (registerClass != 0 && !registerKeys.insert({registerClass, parameter.shaderRegister}).second)
-            Push(diagnostics, "ProgramParameter register is duplicated within its register class", source);
+        if (registerClass != 0 &&
+            !registerKeys.insert({static_cast<std::uint16_t>(parameter.stage), registerClass,
+                                  parameter.shaderRegister}).second)
+            Push(diagnostics, "ProgramParameter register is duplicated within one shader stage/register class", source);
     }
 }
 
@@ -338,6 +374,24 @@ bool ParameterRoleMatches(ProgramParameterKind kind, ViewRole role) noexcept
     }
 }
 
+std::uint16_t WorkStateClass(ViewRole role) noexcept
+{
+    switch (role)
+    {
+    case ViewRole::VertexData: return 1;
+    case ViewRole::ConstantData: return 2;
+    case ViewRole::SampledTexture:
+    case ViewRole::ShaderBuffer: return 3;
+    case ViewRole::StorageBuffer: return 4;
+    case ViewRole::ColorAttachment: return 5;
+    case ViewRole::PresentSource: return 6;
+    case ViewRole::DepthAttachment: return 7;
+    case ViewRole::CopySource: return 8;
+    case ViewRole::CopyDestination: return 9;
+    default: return 0;
+    }
+}
+
 void ValidateWorkInterface(const Work& work, const Program* program,
                            const std::map<std::uint32_t, const ResourceUse*>& uses,
                            const std::map<std::uint32_t, const Resource*>& resources,
@@ -351,6 +405,8 @@ void ValidateWorkInterface(const Work& work, const Program* program,
     std::uint32_t copyDestination = 0;
     std::set<std::uint32_t> uniqueUses;
     std::set<std::uint32_t> boundParameters;
+    std::map<std::pair<std::uint32_t, TemporalRelation>, std::uint16_t> resourceStateClasses;
+    const ResourceUse* vertexUse = nullptr;
     const ResourceUse* colorUse = nullptr;
     const ResourceUse* presentUse = nullptr;
     const ResourceUse* copySourceUse = nullptr;
@@ -367,6 +423,19 @@ void ValidateWorkInterface(const Work& work, const Program* program,
             continue;
         }
         const auto* use = found->second;
+        const auto stateClass = WorkStateClass(use->role);
+        const auto stateKey = std::pair{use->resource.value, use->temporalRelation};
+        const auto existingState = resourceStateClasses.find(stateKey);
+        const bool surfaceDrawThenPresent = existingState != resourceStateClasses.end() &&
+            ((existingState->second == WorkStateClass(ViewRole::ColorAttachment) &&
+              stateClass == WorkStateClass(ViewRole::PresentSource)) ||
+             (existingState->second == WorkStateClass(ViewRole::PresentSource) &&
+              stateClass == WorkStateClass(ViewRole::ColorAttachment)));
+        if (existingState != resourceStateClasses.end() && existingState->second != stateClass &&
+            !surfaceDrawThenPresent)
+            Push(diagnostics, "one Work requires incompatible semantic states for the same Resource generation", source);
+        else if (existingState == resourceStateClasses.end())
+            resourceStateClasses[stateKey] = stateClass;
         switch (operand.kind)
         {
         case WorkOperandKind::ProgramParameter:
@@ -396,7 +465,7 @@ void ValidateWorkInterface(const Work& work, const Program* program,
             break;
         }
         case WorkOperandKind::VertexData:
-            ++vertex;
+            ++vertex; vertexUse = use;
             if (use->role != ViewRole::VertexData) Push(diagnostics, "VertexData operand role mismatch", source);
             break;
         case WorkOperandKind::ColorAttachment:
@@ -436,6 +505,19 @@ void ValidateWorkInterface(const Work& work, const Program* program,
             Push(diagnostics, "raster work operand structure is outside Level 2 v1", source);
         if (colorUse != nullptr && presentUse != nullptr && colorUse->resource != presentUse->resource)
             Push(diagnostics, "raster ColorAttachment and PresentSource must reference the same SurfaceImage", source);
+        if (program != nullptr && vertexUse != nullptr)
+        {
+            const auto resource = resources.find(vertexUse->resource.value);
+            if (resource != resources.end())
+            {
+                const auto* vertexResource = resource->second;
+                const auto requiredBytes = static_cast<std::uint64_t>(work.raster.vertexCount) *
+                                           program->interface.vertexStrideBytes;
+                if (vertexResource->buffer.strideBytes != program->interface.vertexStrideBytes ||
+                    requiredBytes > vertexResource->buffer.sizeBytes)
+                    Push(diagnostics, "raster vertex buffer stride/range does not match ProgramInterface", source);
+            }
+        }
     }
     else if (work.kind == WorkKind::Compute)
     {
@@ -511,6 +593,7 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         ValidateProgram(graph.programs[index], static_cast<std::uint32_t>(index), diagnostics);
 
     std::map<std::uint32_t, std::uint32_t> useOwners;
+    std::map<std::uint32_t, std::uint32_t> programOwners;
     for (std::size_t index = 0; index < graph.works.size(); ++index)
     {
         const auto& work = graph.works[index];
@@ -521,7 +604,11 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         if (programId.IsValid())
         {
             const auto found = programs.find(programId.value);
-            if (found != programs.end()) program = found->second;
+            if (found != programs.end())
+            {
+                program = found->second;
+                ++programOwners[programId.value];
+            }
             else Push(diagnostics, "work references an unknown program", static_cast<std::uint32_t>(index));
         }
         ValidateWorkInterface(work, program, uses, resources, static_cast<std::uint32_t>(index), diagnostics);
@@ -541,6 +628,26 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         if (resource != resources.end() && resource->second->lifetime == LifetimeIntent::Preparation)
             Push(diagnostics, "Preparation resource cannot be referenced by frame Work", id);
     }
+
+    for (const auto& [id, program] : programs)
+        if (programOwners[id] == 0)
+            Push(diagnostics, "every Program must be referenced by at least one Raster or Compute Work", id);
+
+    std::map<std::uint32_t, std::uint32_t> temporalCurrentWriters;
+    std::map<std::uint32_t, std::uint32_t> temporalPreviousReaders;
+    for (const auto& [id, use] : uses)
+    {
+        const auto resource = resources.find(use->resource.value);
+        if (resource == resources.end() || resource->second->lifetime != LifetimeIntent::Temporal) continue;
+        if (use->temporalRelation == TemporalRelation::Previous && IsRead(use->effect))
+            ++temporalPreviousReaders[use->resource.value];
+        if (use->temporalRelation == TemporalRelation::Current && IsWrite(use->effect))
+            ++temporalCurrentWriters[use->resource.value];
+    }
+    for (const auto& [id, resource] : resources)
+        if (resource->lifetime == LifetimeIntent::Temporal &&
+            (temporalCurrentWriters[id] != 1 || temporalPreviousReaders[id] == 0))
+            Push(diagnostics, "Temporal resource requires exactly one current writer and at least one previous reader", id);
 
     std::set<std::uint32_t> usedPreparations;
     for (const auto& resource : graph.resources)
