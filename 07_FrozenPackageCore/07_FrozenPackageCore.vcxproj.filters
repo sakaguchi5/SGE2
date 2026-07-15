@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="FrozenExecutablePackage.cpp" />
+    <ClCompile Include="PackageDigest.cpp" />
+    <ClCompile Include="PackageReader.cpp" />
+    <ClCompile Include="PackageWriter.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="FrozenExecutablePackage.h" />
+    <ClInclude Include="PackageDigest.h" />
+    <ClInclude Include="PackageFormat.h" />
+    <ClInclude Include="PackageReader.h" />
+    <ClInclude Include="PackageWriter.h" />
+  </ItemGroup>
+</Project>

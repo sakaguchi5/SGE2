@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="BinaryIO.cpp" />
+    <ClCompile Include="FileIO.cpp" />
+    <ClCompile Include="Sha256.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Base.h" />
+    <ClInclude Include="BinaryIO.h" />
+    <ClInclude Include="CheckedMath.h" />
+    <ClInclude Include="FileIO.h" />
+    <ClInclude Include="Result.h" />
+    <ClInclude Include="Sha256.h" />
+    <ClInclude Include="StrongId.h" />
+  </ItemGroup>
+</Project>

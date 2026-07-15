@@ -1,0 +1,331 @@
+#include "../04_SemanticAnalysis/SemanticAnalysis.h"
+#include "../05_TargetModel/TargetModel.h"
+#include "../06_D3D12TargetCompiler/D3D12TargetCompiler.h"
+#include "../07_FrozenPackageCore/PackageReader.h"
+#include "../08_D3D12PackageSchema/D3D12Encoding.h"
+#include "../20_ClassicalFrontend/ClassicalTriangle.h"
+
+#include <algorithm>
+#include <iostream>
+#include <map>
+#include <string_view>
+
+namespace
+{
+namespace sem = sge::semantic;
+namespace pkg = sge::package::d3d12_v13;
+
+bool Contains(std::span<const std::byte> bytes, std::string_view text)
+{
+    const auto* begin = reinterpret_cast<const char*>(bytes.data());
+    return std::search(begin, begin + bytes.size(), text.begin(), text.end()) != begin + bytes.size();
+}
+
+sem::SemanticGraph RemapToSparseIds(sem::SemanticGraph graph)
+{
+    std::map<std::uint32_t, sem::ResourceId> resources;
+    std::map<std::uint32_t, sem::ResourceUseId> uses;
+    std::map<std::uint32_t, sem::ProgramId> programs;
+    std::map<std::uint32_t, sem::WorkId> works;
+    for (const auto& value : graph.resources) resources[value.id.value] = {value.id.value * 10u + 7u};
+    for (const auto& value : graph.resourceUses) uses[value.id.value] = {value.id.value * 10u + 9u};
+    for (const auto& value : graph.programs) programs[value.id.value] = {value.id.value * 10u + 11u};
+    for (const auto& value : graph.works) works[value.id.value] = {value.id.value * 10u + 13u};
+
+    for (auto& resource : graph.resources) resource.id = resources.at(resource.id.value);
+    for (auto& use : graph.resourceUses)
+    {
+        use.id = uses.at(use.id.value);
+        use.resource = resources.at(use.resource.value);
+    }
+    const auto mapUse = [&](sem::ResourceUseId id) { return id.IsValid() ? uses.at(id.value) : id; };
+    const auto mapProgram = [&](sem::ProgramId id) { return id.IsValid() ? programs.at(id.value) : id; };
+    for (auto& program : graph.programs) program.id = programs.at(program.id.value);
+    for (auto& work : graph.works)
+    {
+        const auto oldWork = work.id;
+        work.id = works.at(oldWork.value);
+        for (auto& use : work.uses) use = mapUse(use);
+        for (auto& dependency : work.dependencies) dependency = works.at(dependency.value);
+        work.raster.program = mapProgram(work.raster.program);
+        work.raster.vertexData = mapUse(work.raster.vertexData);
+        work.raster.constantData = mapUse(work.raster.constantData);
+        work.raster.sampledTexture = mapUse(work.raster.sampledTexture);
+        work.raster.computedData = mapUse(work.raster.computedData);
+        work.raster.copiedData = mapUse(work.raster.copiedData);
+        work.raster.aliasedData = mapUse(work.raster.aliasedData);
+        work.raster.externalData = mapUse(work.raster.externalData);
+        work.raster.colorAttachment = mapUse(work.raster.colorAttachment);
+        work.raster.depthAttachment = mapUse(work.raster.depthAttachment);
+        work.raster.presentSource = mapUse(work.raster.presentSource);
+        work.copy.source = mapUse(work.copy.source);
+        work.copy.destination = mapUse(work.copy.destination);
+        work.compute.program = mapProgram(work.compute.program);
+        work.compute.constantData = mapUse(work.compute.constantData);
+        work.compute.previous = mapUse(work.compute.previous);
+        work.compute.output = mapUse(work.compute.output);
+    }
+    std::reverse(graph.resources.begin(), graph.resources.end());
+    std::reverse(graph.resourceUses.begin(), graph.resourceUses.end());
+    std::reverse(graph.programs.begin(), graph.programs.end());
+    std::reverse(graph.works.begin(), graph.works.end());
+    return graph;
+}
+
+sem::SemanticGraph AddIndependentCopy(sem::SemanticGraph graph)
+{
+    const auto& oldCopy = *std::find_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
+        return work.kind == sem::WorkKind::Copy;
+    });
+    const auto& oldSourceUse = graph.resourceUses[oldCopy.copy.source.value];
+    const auto& oldDestinationUse = graph.resourceUses[oldCopy.copy.destination.value];
+
+    auto source = graph.resources[oldSourceUse.resource.value];
+    source.id = {100};
+    source.debugName = "GenericExtraCopySource";
+    auto destination = graph.resources[oldDestinationUse.resource.value];
+    destination.id = {200};
+    destination.debugName = "GenericExtraCopyDestination";
+    graph.resources.push_back(source);
+    graph.resources.push_back(destination);
+
+    sem::ResourceUse sourceUse{{100}, source.id, sem::Effect::Read, sem::ViewRole::CopySource};
+    sem::ResourceUse destinationUse{{101}, destination.id, sem::Effect::Write, sem::ViewRole::CopyDestination};
+    graph.resourceUses.push_back(sourceUse);
+    graph.resourceUses.push_back(destinationUse);
+
+    sem::Work work;
+    work.id = {100};
+    work.debugName = "GenericExtraCopy";
+    work.kind = sem::WorkKind::Copy;
+    work.uses = {sourceUse.id, destinationUse.id};
+    work.copy = {sourceUse.id, destinationUse.id, oldCopy.copy.bytes};
+    graph.works.push_back(work);
+    return graph;
+}
+
+sem::SemanticGraph AddRasterBinding(sem::SemanticGraph graph)
+{
+    const auto source = std::find_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
+        return resource.kind == sem::ResourceKind::Buffer &&
+               resource.update == sem::UpdateIntent::Immutable &&
+               resource.lifetime == sem::LifetimeIntent::Persistent &&
+               resource.buffer.sizeBytes == 16;
+    });
+    auto resource = *source;
+    resource.id = {300};
+    resource.debugName = "GenericAdditionalRasterBinding";
+    graph.resources.push_back(resource);
+    sem::ResourceUse use{{300}, resource.id, sem::Effect::Read, sem::ViewRole::CopiedBuffer};
+    graph.resourceUses.push_back(use);
+    auto raster = std::find_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
+        return work.kind == sem::WorkKind::Raster;
+    });
+    raster->uses.push_back(use.id);
+    auto program = std::find_if(graph.programs.begin(), graph.programs.end(), [&](const auto& value) {
+        return value.id == raster->raster.program;
+    });
+    ++program->interface.sampledBufferCount;
+    return graph;
+}
+
+std::uint32_t Count(std::span<const pkg::OperationView> operations, pkg::D3D12OperationCode code)
+{
+    return static_cast<std::uint32_t>(std::count_if(operations.begin(), operations.end(), [code](const auto& operation) {
+        return operation.opcode == code;
+    }));
+}
+}
+
+int main()
+{
+    auto graphResult = sge::classical::BuildTriangleGraph();
+    if (!graphResult) return 1;
+    const auto& graph = graphResult.Value();
+    sge::target::D3D12TargetProfile profile;
+
+    auto first = sge::compiler::d3d12::Compile(graph, profile);
+    auto second = sge::compiler::d3d12::Compile(graph, profile);
+    if (!first || !second)
+    {
+        const auto& error = !first ? first.Error() : second.Error();
+        std::cerr << error.stage << ": " << error.message << '\n';
+        return 2;
+    }
+    if (first.Value().packageBytes != second.Value().packageBytes ||
+        first.Value().executionDigestHex != second.Value().executionDigestHex)
+        return 3;
+
+    auto sparse = RemapToSparseIds(graph);
+    auto sparsePackage = sge::compiler::d3d12::Compile(sparse, profile);
+    if (!sparsePackage || sparsePackage.Value().packageBytes != first.Value().packageBytes)
+    {
+        if (!sparsePackage) std::cerr << sparsePackage.Error().stage << ": " << sparsePackage.Error().message << '\n';
+        std::cerr << "canonical lowering depends on vector order or dense Source IDs\n";
+        return 4;
+    }
+
+    for (const auto text : {"VSMain", "PSMain", "CSMain", "ComputeColorOutput", "PreviousFrameColor",
+                            "CopiedColorInput", "TemporalColorHistory", "AliasWarmup", "AliasedRasterColor",
+                            "ExternalFrameColor", "CommonExperimentVertices", "DrawCommonExperiment",
+                            "Classical", "Sdf", "HalfSpace2D", "TriangleField"})
+        if (Contains(first.Value().packageBytes, text))
+        {
+            std::cerr << "source leaked: " << text << '\n';
+            return 5;
+        }
+
+    auto frozen = sge::package::PackageReader::Read(first.Value().packageBytes);
+    if (!frozen) { std::cerr << frozen.Error().message << '\n'; return 6; }
+    if (frozen.Value().Header().targetSchemaVersion != 13 ||
+        frozen.Value().Header().minimumRuntimeVersion != 13)
+        return 7;
+    auto decoded = pkg::D3D12PackageView::Decode(frozen.Value());
+    if (!decoded) { std::cerr << decoded.Error().message << '\n'; return 8; }
+    const auto& view = decoded.Value();
+
+    const auto rasterWorks = static_cast<std::size_t>(std::count_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
+        return work.kind == sem::WorkKind::Raster;
+    }));
+    const auto computeWorks = static_cast<std::size_t>(std::count_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
+        return work.kind == sem::WorkKind::Compute;
+    }));
+    const auto externalResources = static_cast<std::size_t>(std::count_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
+        return resource.lifetime == sem::LifetimeIntent::External && resource.kind != sem::ResourceKind::SurfaceImage;
+    }));
+    const auto surfaceResources = static_cast<std::size_t>(std::count_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
+        return resource.kind == sem::ResourceKind::SurfaceImage;
+    }));
+    const auto dynamicResources = static_cast<std::size_t>(std::count_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
+        return resource.update == sem::UpdateIntent::DynamicPerFrame;
+    }));
+    if (view.Resources().size() != graph.resources.size() || view.Views().size() != graph.resourceUses.size() ||
+        view.Executables().size() != rasterWorks || view.RasterCommands().size() != rasterWorks ||
+        view.ComputeExecutables().size() != computeWorks || view.ComputeCommands().size() != computeWorks ||
+        view.Programs().size() != rasterWorks + computeWorks ||
+        view.BindingLayouts().size() != rasterWorks + computeWorks ||
+        view.ExternalSlots().size() != externalResources || view.SurfaceSlots().size() != surfaceResources ||
+        view.DynamicSlots().size() != dynamicResources)
+    {
+        std::cerr << "artifact cardinalities were not derived from the graph\n";
+        return 9;
+    }
+
+    std::vector<const pkg::ResourceArtifact*> aliased;
+    for (const auto& resource : view.Resources())
+        if ((resource.flags & static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased)) != 0)
+            aliased.push_back(&resource);
+    if (aliased.size() != 2 || aliased[0]->allocation != aliased[1]->allocation)
+        return 10;
+    const auto& aliasAllocation = view.Allocations()[aliased[0]->allocation.value];
+    if (aliasAllocation.kind != pkg::AllocationKind::Placed ||
+        aliasAllocation.aliasGroup == sge::package::InvalidIndex ||
+        aliasAllocation.alignment != 65536)
+        return 11;
+
+    std::vector<pkg::ActivateAliasPayload> activations;
+    for (const auto& operation : view.LoadOperations())
+    {
+        if (operation.opcode != pkg::D3D12OperationCode::ActivateAlias) continue;
+        auto payload = pkg::DecodeActivateAlias(operation.payload);
+        if (!payload) return 12;
+        activations.push_back(payload.Value());
+    }
+    if (activations.size() != 2 || activations[0].before.IsValid() ||
+        activations[0].after != aliased[0]->id ||
+        activations[1].before != aliased[0]->id || activations[1].after != aliased[1]->id)
+        return 13;
+
+    std::uint32_t rootParameterCount = 0;
+    for (const auto& layout : view.BindingLayouts())
+    {
+        rootParameterCount += layout.parameterRange.count;
+        for (std::uint32_t index = layout.parameterRange.first;
+             index < layout.parameterRange.first + layout.parameterRange.count; ++index)
+        {
+            const auto& parameter = view.RootParameters()[index];
+            if (parameter.rootParameterIndex != index - layout.parameterRange.first) return 14;
+            if (parameter.kind != pkg::RootParameterKind::ConstantBuffer && !parameter.staticView.IsValid()) return 15;
+        }
+    }
+    if (rootParameterCount != view.RootParameters().size()) return 16;
+
+    const auto& frame = view.FrameOperations();
+    if (Count(frame, pkg::D3D12OperationCode::ExecuteRaster) != rasterWorks ||
+        Count(frame, pkg::D3D12OperationCode::ExecuteCompute) != computeWorks ||
+        Count(frame, pkg::D3D12OperationCode::ExecuteCopy) != 1 ||
+        Count(frame, pkg::D3D12OperationCode::AcquireExternal) != externalResources ||
+        Count(frame, pkg::D3D12OperationCode::ReleaseExternal) != externalResources ||
+        Count(frame, pkg::D3D12OperationCode::PresentSurface) != surfaceResources ||
+        Count(frame, pkg::D3D12OperationCode::ApplyDynamicData) != dynamicResources)
+        return 17;
+    if (Count(frame, pkg::D3D12OperationCode::WaitQueue) == 0 ||
+        Count(frame, pkg::D3D12OperationCode::WaitTemporal) == 0)
+        return 18;
+
+    const auto transitionCount = Count(frame, pkg::D3D12OperationCode::Transition);
+    if (transitionCount == 0) return 19;
+    for (const auto& operation : frame)
+    {
+        if (operation.opcode != pkg::D3D12OperationCode::Transition) continue;
+        auto transition = pkg::DecodeTransition(operation.payload);
+        if (!transition || transition.Value().before == transition.Value().after ||
+            !transition.Value().view.IsValid() || transition.Value().view.value >= view.Views().size())
+            return 20;
+    }
+
+    auto extendedGraph = AddIndependentCopy(graph);
+    auto extended = sge::compiler::d3d12::Compile(extendedGraph, profile);
+    if (!extended)
+    {
+        std::cerr << extended.Error().stage << ": " << extended.Error().message << '\n';
+        return 21;
+    }
+    auto extendedFrozen = sge::package::PackageReader::Read(extended.Value().packageBytes);
+    if (!extendedFrozen) return 22;
+    auto extendedViewResult = pkg::D3D12PackageView::Decode(extendedFrozen.Value());
+    if (!extendedViewResult) return 23;
+    const auto& extendedView = extendedViewResult.Value();
+    if (extendedView.Resources().size() != view.Resources().size() + 2 ||
+        extendedView.Views().size() != view.Views().size() + 2 ||
+        Count(extendedView.FrameOperations(), pkg::D3D12OperationCode::ExecuteCopy) != 2)
+        return 24;
+
+    auto bindingGraph = AddRasterBinding(graph);
+    auto bindingPackage = sge::compiler::d3d12::Compile(bindingGraph, profile);
+    if (!bindingPackage)
+    {
+        std::cerr << bindingPackage.Error().stage << ": " << bindingPackage.Error().message << '\n';
+        return 25;
+    }
+    auto bindingFrozen = sge::package::PackageReader::Read(bindingPackage.Value().packageBytes);
+    if (!bindingFrozen) return 26;
+    auto bindingViewResult = pkg::D3D12PackageView::Decode(bindingFrozen.Value());
+    if (!bindingViewResult || bindingViewResult.Value().Views().size() != view.Views().size() + 1 ||
+        bindingViewResult.Value().RootParameters().size() != view.RootParameters().size() + 1)
+        return 27;
+
+    auto multiQueueProfile = profile;
+    multiQueueProfile.computeQueueCount = 1;
+    auto multiQueue = sge::compiler::d3d12::Compile(graph, multiQueueProfile);
+    if (!multiQueue) return 28;
+    auto multiFrozen = sge::package::PackageReader::Read(multiQueue.Value().packageBytes);
+    if (!multiFrozen) return 29;
+    auto multiViewResult = pkg::D3D12PackageView::Decode(multiFrozen.Value());
+    if (!multiViewResult) return 30;
+    bool computeOnCompute = false;
+    bool copyOnCopy = false;
+    for (const auto& operation : multiViewResult.Value().FrameOperations())
+    {
+        if (operation.opcode == pkg::D3D12OperationCode::ExecuteCompute && operation.queue.value == 1)
+            computeOnCompute = true;
+        if (operation.opcode == pkg::D3D12OperationCode::ExecuteCopy && operation.queue.value == 2)
+            copyOnCopy = true;
+    }
+    if (!computeOnCompute || !copyOnCopy ||
+        Count(multiViewResult.Value().FrameOperations(), pkg::D3D12OperationCode::WaitQueue) < 2)
+        return 31;
+
+    std::cout << "Generic cardinality, dependency, lifetime, state, queue, allocation, binding, and Package lowering tests passed.\n";
+    return 0;
+}

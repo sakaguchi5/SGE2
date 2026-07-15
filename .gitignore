@@ -1,0 +1,8 @@
+.vs/
+build/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.sgep
+*.sgedbg
