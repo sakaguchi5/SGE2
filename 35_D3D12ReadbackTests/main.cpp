@@ -47,9 +47,18 @@ int RunFreshProcessChild(const std::filesystem::path& packagePath)
     invocation.dynamicData = std::span<const sge::runtime::DynamicDataBinding>(&dynamicBinding, 1);
     invocation.externalResources = std::span<const sge::runtime::ExternalResourceBinding>(&externalBinding, 1);
     auto submitted = sge::runtime::Submit(loaded.Value(), executor, invocation);
-    if (!submitted || submitted.Value().deviceEpoch != 1 || submitted.Value().frameSlot != 0 ||
-        submitted.Value().temporalPreviousInstance != 1 || submitted.Value().temporalCurrentInstance != 0)
+    if (!submitted)
+    {
+        std::cerr << "Fresh-process Submit failed at " << submitted.Error().stage
+                  << ": " << submitted.Error().message << '\n';
         return 45;
+    }
+    if (submitted.Value().deviceEpoch != 1 || submitted.Value().frameSlot != 0 ||
+        submitted.Value().temporalPreviousInstance != 1 || submitted.Value().temporalCurrentInstance != 0)
+    {
+        std::cerr << "Fresh-process submission metadata mismatch.\n";
+        return 45;
+    }
 
     std::cout << "Fresh-process Frozen Package rematerialization passed.\n";
     return 0;
@@ -110,7 +119,12 @@ int wmain(int argc, wchar_t** argv)
     const auto constantBytes = std::as_bytes(std::span<const float>(Identity));
     const sge::runtime::DynamicDataBinding dynamicBinding{0, constantBytes};
     auto external = executor.CreateExternalColorBuffer(loaded.Value().Instance(), ExternalColor);
-    if (!external) return 5;
+    if (!external)
+    {
+        std::cerr << "External buffer creation failed at " << external.Error().stage
+                  << ": " << external.Error().message << '\n';
+        return 5;
+    }
     sge::runtime::ExternalResourceBinding externalBinding{0, external.Value().resource, external.Value().availableAfter};
 
     for (std::uint64_t frameNumber = 0; frameNumber < 2; ++frameNumber)
@@ -120,9 +134,18 @@ int wmain(int argc, wchar_t** argv)
         invocation.dynamicData = std::span<const sge::runtime::DynamicDataBinding>(&dynamicBinding, 1);
         invocation.externalResources = std::span<const sge::runtime::ExternalResourceBinding>(&externalBinding, 1);
         auto submitted = sge::runtime::Submit(loaded.Value(), executor, invocation);
-        if (!submitted || submitted.Value().deviceEpoch != 1 || submitted.Value().frameSlot != frameNumber ||
-            submitted.Value().releasedExternalResources.size() != 1 || !submitted.Value().releasedExternalResources[0].safeAfter)
+        if (!submitted)
+        {
+            std::cerr << "Frame " << frameNumber << " Submit failed at " << submitted.Error().stage
+                      << ": " << submitted.Error().message << '\n';
             return 6;
+        }
+        if (submitted.Value().deviceEpoch != 1 || submitted.Value().frameSlot != frameNumber ||
+            submitted.Value().releasedExternalResources.size() != 1 || !submitted.Value().releasedExternalResources[0].safeAfter)
+        {
+            std::cerr << "Frame " << frameNumber << " submission metadata mismatch.\n";
+            return 6;
+        }
         externalBinding.availableAfter = submitted.Value().releasedExternalResources[0].safeAfter;
     }
 
@@ -162,10 +185,19 @@ int wmain(int argc, wchar_t** argv)
     epoch2Invocation.dynamicData = std::span<const sge::runtime::DynamicDataBinding>(&dynamicBinding, 1);
     epoch2Invocation.externalResources = std::span<const sge::runtime::ExternalResourceBinding>(&externalBinding, 1);
     auto epoch2Frame = sge::runtime::Submit(loaded.Value(), executor, epoch2Invocation);
-    if (!epoch2Frame || epoch2Frame.Value().deviceEpoch != 2 || epoch2Frame.Value().reusedSlotFenceValue != 0 ||
+    if (!epoch2Frame)
+    {
+        std::cerr << "Post-recovery Submit failed at " << epoch2Frame.Error().stage
+                  << ": " << epoch2Frame.Error().message << '\n';
+        return 12;
+    }
+    if (epoch2Frame.Value().deviceEpoch != 2 || epoch2Frame.Value().reusedSlotFenceValue != 0 ||
         epoch2Frame.Value().temporalDependencyFenceValue != 0 || epoch2Frame.Value().temporalPreviousInstance != 1 ||
         epoch2Frame.Value().temporalCurrentInstance != 0)
+    {
+        std::cerr << "Post-recovery submission metadata mismatch.\n";
         return 12;
+    }
 
     auto removed = sge::runtime::RecoverDevice(
         loaded.Value(), executor, sge::runtime::DeviceRecoveryMode::ForceRemovalForTest);
