@@ -133,7 +133,9 @@ bool IsCopyQueueState(const pkg::ResourceState& state) noexcept
     return state.explicitBits == copySource || state.explicitBits == copyDestination;
 }
 
-D3D12_RESOURCE_STATES ToNativeState(const pkg::ResourceState& state)
+D3D12_RESOURCE_STATES ToNativeState(
+    const pkg::ResourceState& state,
+    D3D12_COMMAND_LIST_TYPE queueType = D3D12_COMMAND_LIST_TYPE_DIRECT)
 {
     if (state.stateClass == pkg::StateClass::Common) return D3D12_RESOURCE_STATE_COMMON;
     if (state.stateClass == pkg::StateClass::Present) return D3D12_RESOURCE_STATE_PRESENT;
@@ -145,7 +147,17 @@ D3D12_RESOURCE_STATES ToNativeState(const pkg::ResourceState& state)
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::RenderTarget)) result |= D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::DepthWrite)) result |= D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::DepthRead)) result |= D3D12_RESOURCE_STATE_DEPTH_READ;
-    if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::ShaderRead)) result |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::ShaderRead))
+    {
+        // Legacy v13 Package state. New v14 Packages use explicit stage scope.
+        result |= queueType == D3D12_COMMAND_LIST_TYPE_COMPUTE
+            ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::PixelShaderRead))
+        result |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::NonPixelShaderRead))
+        result |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::UnorderedWrite)) result |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopySource)) result |= D3D12_RESOURCE_STATE_COPY_SOURCE;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopyDestination)) result |= D3D12_RESOURCE_STATE_COPY_DEST;
@@ -214,10 +226,9 @@ public:
     {
         if (runtimeState_ == runtime::DeviceRuntimeState::Active)
         {
-            if (queue_ && fence_ && lastFenceValue_ != 0 && fence_->GetCompletedValue() < lastFenceValue_ && fenceEvent_)
-                if (SUCCEEDED(fence_->SetEventOnCompletion(lastFenceValue_, fenceEvent_))) WaitForSingleObject(fenceEvent_, INFINITE);
-            if (copyQueue_ && copyFence_ && copyLastFenceValue_ != 0 && copyFence_->GetCompletedValue() < copyLastFenceValue_ && copyFenceEvent_)
-                if (SUCCEEDED(copyFence_->SetEventOnCompletion(copyLastFenceValue_, copyFenceEvent_))) WaitForSingleObject(copyFenceEvent_, INFINITE);
+            WaitForQueueAtDestruction(DirectQueueId(), lastFenceValue_, fenceEvent_);
+            if (HasComputeQueue()) WaitForQueueAtDestruction(ComputeQueueId(), computeLastFenceValue_, computeFenceEvent_);
+            if (HasCopyQueue()) WaitForQueueAtDestruction(CopyQueueId(), copyLastFenceValue_, copyFenceEvent_);
         }
         ReleaseDeviceObjectsForRecovery();
     }
@@ -252,6 +263,7 @@ public:
                 resources_[resource.id.value].resize(resource.physicalInstanceCount);
         }
         frameSlotFenceValues_.assign(view_.Profile().framesInFlight, 0);
+        computeFrameSlotFenceValues_.assign(view_.Profile().framesInFlight, 0);
         copyFrameSlotFenceValues_.assign(view_.Profile().framesInFlight, 0);
         rootSignatures_.resize(view_.BindingLayouts().size());
         pipelineStates_.resize(view_.Executables().size());
@@ -266,8 +278,8 @@ public:
         }
         if (!descriptorHeapsCreated_)
             return base::Result<void, runtime::RuntimeError>::Failure(Error("load", "CreateDescriptorHeaps operation was not executed"));
-        if (!copyQueueLoadCompleted_)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("load", "Copy queue load batch did not complete"));
+        if (!loadQueueCompleted_)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load", "Package-declared load queue batch did not complete"));
         auto verified = CompleteBufferVerifications();
         if (!verified) return verified;
         auto textureVerified = CompleteTextureVerifications();
@@ -324,7 +336,14 @@ public:
         const auto toCopyDestination = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         producerList->ResourceBarrier(1, &toCopyDestination);
         producerList->CopyBufferRegion(resource.Get(), 0, upload.Get(), 0, sizeof(color));
-        const auto shaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        const auto incomingState = view_.ExternalSlots().empty()
+            ? pkg::ResourceState{pkg::StateClass::Explicit, 0,
+                static_cast<std::uint32_t>(pkg::ExplicitStateBits::PixelShaderRead)}
+            : view_.ExternalSlots().front().requiredIncomingState;
+        const auto shaderRead = ToNativeState(incomingState, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        if (shaderRead == static_cast<D3D12_RESOURCE_STATES>(0))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/incoming-state", "external slot has no executable shader-read state"));
         const auto toShaderRead = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, shaderRead);
         producerList->ResourceBarrier(1, &toShaderRead);
         hr = producerList->Close();
@@ -402,19 +421,24 @@ public:
 
         if (mode == runtime::DeviceRecoveryMode::ControlledRebuild)
         {
-            if (lastFenceValue_ != 0)
+            auto waited = WaitForQueueFence(DirectQueueId(), lastFenceValue_);
+            if (!waited) return base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError>::Failure(waited.Error());
+            if (HasComputeQueue())
             {
-                auto waited = WaitForFence(lastFenceValue_);
+                waited = WaitForQueueFence(ComputeQueueId(), computeLastFenceValue_);
                 if (!waited) return base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError>::Failure(waited.Error());
             }
-            if (copyFence_ && copyLastFenceValue_ != 0 && copyFence_->GetCompletedValue() < copyLastFenceValue_)
+            if (HasCopyQueue())
             {
-                const HRESULT waitResult = copyFence_->SetEventOnCompletion(copyLastFenceValue_, copyFenceEvent_);
-                if (FAILED(waitResult))
-                    return base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError>::Failure(
-                        HResultError("recovery/wait-copy-fence", waitResult, device_.Get()));
-                WaitForSingleObject(copyFenceEvent_, INFINITE);
+                waited = WaitForQueueFence(CopyQueueId(), copyLastFenceValue_);
+                if (!waited) return base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError>::Failure(waited.Error());
             }
+            const HRESULT sourceDeviceReason = device_->GetDeviceRemovedReason();
+            if (FAILED(sourceDeviceReason))
+                return base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError>::Failure(
+                    Error("recovery/controlled-source-device",
+                        "controlled reconstruction cannot begin because prior Package execution removed the device: " +
+                        HResultText(sourceDeviceReason)));
 
             ReleaseDeviceObjectsForRecovery();
             auto rebuilt = Initialize();
@@ -522,15 +546,18 @@ public:
 
         currentFrameSlot_ = static_cast<std::uint32_t>(invocation.frameNumber % view_.Profile().framesInFlight);
         const std::uint64_t reusedSlotFenceValue = frameSlotFenceValues_[currentFrameSlot_];
+        const std::uint64_t reusedComputeSlotFenceValue = computeFrameSlotFenceValues_[currentFrameSlot_];
         const std::uint64_t reusedCopySlotFenceValue = copyFrameSlotFenceValues_[currentFrameSlot_];
-        if (reusedSlotFenceValue != 0)
+        auto waited = WaitForQueueFence(DirectQueueId(), reusedSlotFenceValue);
+        if (!waited) return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Failure(waited.Error());
+        if (HasComputeQueue())
         {
-            auto waited = WaitForFence(reusedSlotFenceValue);
+            waited = WaitForQueueFence(ComputeQueueId(), reusedComputeSlotFenceValue);
             if (!waited) return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Failure(waited.Error());
         }
-        if (reusedCopySlotFenceValue != 0)
+        if (HasCopyQueue())
         {
-            auto waited = WaitForCopyFence(reusedCopySlotFenceValue);
+            waited = WaitForQueueFence(CopyQueueId(), reusedCopySlotFenceValue);
             if (!waited) return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Failure(waited.Error());
         }
 
@@ -540,15 +567,20 @@ public:
         temporalPreviousInstance_ = (currentFrameSlot_ + view_.Profile().framesInFlight - 1u) % view_.Profile().framesInFlight;
         temporalCurrentInstance_ = currentFrameSlot_;
         previousDirectFenceValue_ = lastFenceValue_;
+        previousComputeFenceValue_ = computeLastFenceValue_;
         previousCopyFenceValue_ = copyLastFenceValue_;
-        temporalDependencyFenceValue_ = previousDirectFenceValue_;
+        temporalDependencyFenceValue_ = 0;
         frameFenceValue_ = 0;
+        computeFrameFenceValue_ = 0;
         copyFrameFenceValue_ = 0;
         directFrameBatchCursor_ = 0;
+        computeFrameBatchCursor_ = 0;
         copyFrameBatchCursor_ = 0;
         directFrameSubmitted_ = false;
+        computeFrameSubmitted_ = false;
         copyFrameSubmitted_ = false;
         commandOpen_ = false;
+        activeCommandQueue_ = package::InvalidIndex;
         copyFrameCommandOpen_ = false;
         std::fill(externalAcquired_.begin(), externalAcquired_.end(), false);
         std::fill(externalWaited_.begin(), externalWaited_.end(), false);
@@ -569,8 +601,7 @@ public:
         if (commandOpen_ || copyFrameCommandOpen_)
             return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Failure(
                 Error("frame", "frame stream ended with an open queue batch"));
-        if ((directFrameSubmitted_ && frameFenceValue_ == 0) ||
-            (copyFrameSubmitted_ && copyFrameFenceValue_ == 0))
+        if (directFrameSubmitted_ || computeFrameSubmitted_ || copyFrameSubmitted_)
             return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Failure(
                 Error("frame", "a queue submitted work without a Package SignalQueue operation"));
         if (std::find(externalReleased_.begin(), externalReleased_.end(), false) != externalReleased_.end())
@@ -581,6 +612,7 @@ public:
                 Error("frame", "frame stream did not present every acquired surface slot"));
 
         frameSlotFenceValues_[currentFrameSlot_] = frameFenceValue_;
+        computeFrameSlotFenceValues_[currentFrameSlot_] = computeFrameFenceValue_;
         copyFrameSlotFenceValues_[currentFrameSlot_] = copyFrameFenceValue_;
         runtime::FrameSubmission submission;
         submission.deviceEpoch = deviceEpoch_;
@@ -591,6 +623,7 @@ public:
         submission.temporalCurrentInstance = temporalCurrentInstance_;
         submission.temporalDependencyFenceValue = temporalDependencyFenceValue_;
         if (frameFenceValue_ != 0) submission.queues.push_back({DirectQueueId().value, frameFenceValue_});
+        if (computeFrameFenceValue_ != 0) submission.queues.push_back({ComputeQueueId().value, computeFrameFenceValue_});
         if (copyFrameFenceValue_ != 0) submission.queues.push_back({CopyQueueId().value, copyFrameFenceValue_});
         submission.releasedExternalResources = frameExternalReleases_;
         hasSubmittedFrame_ = true;
@@ -600,51 +633,127 @@ public:
 
 private:
     [[nodiscard]] pkg::QueueId DirectQueueId() const noexcept { return pkg::QueueId{0}; }
+    [[nodiscard]] pkg::QueueId ComputeQueueId() const noexcept
+    {
+        return pkg::QueueId{view_.Profile().directQueueCount};
+    }
     [[nodiscard]] pkg::QueueId CopyQueueId() const noexcept
     {
         return pkg::QueueId{view_.Profile().directQueueCount + view_.Profile().computeQueueCount};
     }
+    [[nodiscard]] pkg::QueueId LoadQueueId() const noexcept
+    {
+        return HasCopyQueue() ? CopyQueueId() : DirectQueueId();
+    }
+    [[nodiscard]] bool HasComputeQueue() const noexcept { return view_.Profile().computeQueueCount != 0; }
+    [[nodiscard]] bool HasCopyQueue() const noexcept { return view_.Profile().copyQueueCount != 0; }
     [[nodiscard]] bool IsDirectQueue(pkg::QueueId queue) const noexcept
     {
         return queue.IsValid() && queue == DirectQueueId();
     }
+    [[nodiscard]] bool IsComputeQueue(pkg::QueueId queue) const noexcept
+    {
+        return HasComputeQueue() && queue.IsValid() && queue == ComputeQueueId();
+    }
     [[nodiscard]] bool IsCopyQueue(pkg::QueueId queue) const noexcept
     {
-        return queue.IsValid() && queue == CopyQueueId();
+        return HasCopyQueue() && queue.IsValid() && queue == CopyQueueId();
     }
     [[nodiscard]] bool IsSupportedQueue(pkg::QueueId queue) const noexcept
     {
-        return IsDirectQueue(queue) || IsCopyQueue(queue);
+        return IsDirectQueue(queue) || IsComputeQueue(queue) || IsCopyQueue(queue);
+    }
+    [[nodiscard]] D3D12_COMMAND_LIST_TYPE NativeCommandListType(pkg::QueueId queue) const noexcept
+    {
+        if (IsDirectQueue(queue)) return D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (IsComputeQueue(queue)) return D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        return D3D12_COMMAND_LIST_TYPE_COPY;
     }
     [[nodiscard]] ID3D12CommandQueue* NativeQueue(pkg::QueueId queue) const noexcept
     {
         if (IsDirectQueue(queue)) return queue_.Get();
+        if (IsComputeQueue(queue)) return computeQueue_.Get();
         if (IsCopyQueue(queue)) return copyQueue_.Get();
         return nullptr;
     }
     [[nodiscard]] ID3D12Fence* NativeFence(pkg::QueueId queue) const noexcept
     {
         if (IsDirectQueue(queue)) return fence_.Get();
+        if (IsComputeQueue(queue)) return computeFence_.Get();
         if (IsCopyQueue(queue)) return copyFence_.Get();
+        return nullptr;
+    }
+    [[nodiscard]] HANDLE NativeFenceEvent(pkg::QueueId queue) const noexcept
+    {
+        if (IsDirectQueue(queue)) return fenceEvent_;
+        if (IsComputeQueue(queue)) return computeFenceEvent_;
+        if (IsCopyQueue(queue)) return copyFenceEvent_;
         return nullptr;
     }
     [[nodiscard]] ComPtr<ID3D12Fence> FenceReference(pkg::QueueId queue) const noexcept
     {
         if (IsDirectQueue(queue)) return fence_;
+        if (IsComputeQueue(queue)) return computeFence_;
         if (IsCopyQueue(queue)) return copyFence_;
         return {};
     }
     [[nodiscard]] std::uint64_t FrameFenceValue(pkg::QueueId queue) const noexcept
     {
         if (IsDirectQueue(queue)) return frameFenceValue_;
+        if (IsComputeQueue(queue)) return computeFrameFenceValue_;
         if (IsCopyQueue(queue)) return copyFrameFenceValue_;
         return 0;
     }
     [[nodiscard]] std::uint64_t PreviousFrameFenceValue(pkg::QueueId queue) const noexcept
     {
         if (IsDirectQueue(queue)) return previousDirectFenceValue_;
+        if (IsComputeQueue(queue)) return previousComputeFenceValue_;
         if (IsCopyQueue(queue)) return previousCopyFenceValue_;
         return 0;
+    }
+    [[nodiscard]] bool FrameQueueSubmitted(pkg::QueueId queue) const noexcept
+    {
+        if (IsDirectQueue(queue)) return directFrameSubmitted_;
+        if (IsComputeQueue(queue)) return computeFrameSubmitted_;
+        if (IsCopyQueue(queue)) return copyFrameSubmitted_;
+        return false;
+    }
+    void SetFrameQueueSubmitted(pkg::QueueId queue, bool value) noexcept
+    {
+        if (IsDirectQueue(queue)) directFrameSubmitted_ = value;
+        else if (IsComputeQueue(queue)) computeFrameSubmitted_ = value;
+        else if (IsCopyQueue(queue)) copyFrameSubmitted_ = value;
+    }
+    void SetFrameFenceValue(pkg::QueueId queue, std::uint64_t value) noexcept
+    {
+        if (IsDirectQueue(queue)) { lastFenceValue_ = value; frameFenceValue_ = value; }
+        else if (IsComputeQueue(queue)) { computeLastFenceValue_ = value; computeFrameFenceValue_ = value; }
+        else if (IsCopyQueue(queue)) { copyLastFenceValue_ = value; copyFrameFenceValue_ = value; }
+    }
+    [[nodiscard]] std::uint64_t NextFenceValue(pkg::QueueId queue) noexcept
+    {
+        if (IsDirectQueue(queue)) return nextFenceValue_++;
+        if (IsComputeQueue(queue)) return computeNextFenceValue_++;
+        return copyNextFenceValue_++;
+    }
+    base::Result<void, runtime::RuntimeError> WaitForQueueFence(pkg::QueueId queue, std::uint64_t value)
+    {
+        if (value == 0) return base::Result<void, runtime::RuntimeError>::Success();
+        auto* fence = NativeFence(queue);
+        const auto eventHandle = NativeFenceEvent(queue);
+        if (!fence || !eventHandle)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("queue/wait", "Package queue fence is unavailable"));
+        if (fence->GetCompletedValue() >= value) return base::Result<void, runtime::RuntimeError>::Success();
+        const HRESULT hr = fence->SetEventOnCompletion(value, eventHandle);
+        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("queue/set-fence-event", hr, device_.Get()));
+        WaitForSingleObject(eventHandle, INFINITE);
+        return base::Result<void, runtime::RuntimeError>::Success();
+    }
+    void WaitForQueueAtDestruction(pkg::QueueId queue, std::uint64_t value, HANDLE eventHandle) noexcept
+    {
+        auto* fence = NativeFence(queue);
+        if (!fence || value == 0 || !eventHandle || fence->GetCompletedValue() >= value) return;
+        if (SUCCEEDED(fence->SetEventOnCompletion(value, eventHandle))) WaitForSingleObject(eventHandle, INFINITE);
     }
     [[nodiscard]] const pkg::ResourceViewArtifact* FindShaderResourceView(pkg::ResourceId resource) const noexcept
     {
@@ -707,10 +816,6 @@ private:
 
     void ReleaseDeviceObjectsForRecovery() noexcept
     {
-        // Destroy the device-owned object graph in reverse dependency order.
-        // Recorded command objects are discarded before the resources they mention.
-        // Surface images reference the swap chain; the swap chain references the Direct queue.
-        // A removed device is never waited on.
         externalNativeResources_.clear();
         externalBindings_.clear();
         externalAcquired_.clear();
@@ -724,16 +829,19 @@ private:
 
         commandList_.Reset();
         copyCommandList_.Reset();
+        loadCommandList_.Reset();
         frameCommandLists_.clear();
+        computeFrameCommandLists_.clear();
         copyFrameCommandLists_.clear();
         allocator_.Reset();
         copyAllocator_.Reset();
+        loadAllocator_.Reset();
         frameAllocators_.clear();
+        computeFrameAllocators_.clear();
         copyFrameAllocators_.clear();
 
         backBuffers_.clear();
         swapChain_.Reset();
-
         pendingBufferVerifications_.clear();
         pendingTextureVerifications_.clear();
         uploadResources_.clear();
@@ -748,11 +856,14 @@ private:
         shaderHeap_.Reset();
 
         fence_.Reset();
+        computeFence_.Reset();
         copyFence_.Reset();
         if (fenceEvent_) { CloseHandle(fenceEvent_); fenceEvent_ = nullptr; }
+        if (computeFenceEvent_) { CloseHandle(computeFenceEvent_); computeFenceEvent_ = nullptr; }
         if (copyFenceEvent_) { CloseHandle(copyFenceEvent_); copyFenceEvent_ = nullptr; }
 
         queue_.Reset();
+        computeQueue_.Reset();
         copyQueue_.Reset();
         device_.Reset();
         factory_.Reset();
@@ -762,20 +873,23 @@ private:
         dynamicApplied_.clear();
 
         nextFenceValue_ = 1; lastFenceValue_ = 0;
+        computeNextFenceValue_ = 1; computeLastFenceValue_ = 0;
         copyNextFenceValue_ = 1; copyLastFenceValue_ = 0;
-        frameFenceValue_ = 0; copyFrameFenceValue_ = 0;
+        frameFenceValue_ = 0; computeFrameFenceValue_ = 0; copyFrameFenceValue_ = 0;
         frameSlotFenceValues_.clear();
+        computeFrameSlotFenceValues_.clear();
         copyFrameSlotFenceValues_.clear();
         currentFrameSlot_ = 0;
         temporalPreviousInstance_ = 1; temporalCurrentInstance_ = 0;
         temporalDependencyFenceValue_ = 0;
-        previousDirectFenceValue_ = 0; previousCopyFenceValue_ = 0;
+        previousDirectFenceValue_ = 0; previousComputeFenceValue_ = 0; previousCopyFenceValue_ = 0;
         lastSubmittedFrameNumber_ = 0; hasSubmittedFrame_ = false;
         descriptorHeapsCreated_ = false;
-        commandOpen_ = false; directFrameSubmitted_ = false;
+        commandOpen_ = false; activeCommandQueue_ = package::InvalidIndex;
+        directFrameSubmitted_ = false; computeFrameSubmitted_ = false;
         copyFrameCommandOpen_ = false; copyFrameSubmitted_ = false;
-        directFrameBatchCursor_ = 0; copyFrameBatchCursor_ = 0;
-        copyLoadBatchOpen_ = false; copyLoadBatchClosed_ = false; copyQueueLoadCompleted_ = false;
+        directFrameBatchCursor_ = 0; computeFrameBatchCursor_ = 0; copyFrameBatchCursor_ = 0;
+        loadBatchOpen_ = false; loadBatchClosed_ = false; loadQueueCompleted_ = false;
         rtvIncrement_ = 0; dsvIncrement_ = 0; shaderDescriptorIncrement_ = 0;
         currentBackBuffer_ = 0;
         hasActiveAdapterLuid_ = false;
@@ -787,16 +901,18 @@ private:
         if (view_.Profile().minimumFeatureLevel != 0xb000 || view_.Profile().shaderModelMajor != 5 || view_.Profile().shaderModelMinor != 1 ||
             view_.Profile().rootSignatureMajor != 1 || view_.Profile().rootSignatureMinor != 0 ||
             view_.Profile().framesInFlight == 0 || view_.Profile().directQueueCount != 1 ||
-            view_.Profile().computeQueueCount != 0 || view_.Profile().copyQueueCount != 1)
+            view_.Profile().computeQueueCount > 1 || view_.Profile().copyQueueCount > 1)
             return base::Result<void, runtime::RuntimeError>::Failure(Error("target-profile",
-                "Executor currently supports one Package-declared Direct queue and one Package-declared Copy queue"));
+                "Executor supports one Direct queue and at most one Package-declared Compute and Copy queue"));
 
         std::uint32_t directFrameBatchCount = 0;
+        std::uint32_t computeFrameBatchCount = 0;
         std::uint32_t copyFrameBatchCount = 0;
         for (const auto& operation : view_.FrameOperations())
         {
             if (operation.opcode != pkg::D3D12OperationCode::BeginQueueBatch) continue;
             if (IsDirectQueue(operation.queue)) ++directFrameBatchCount;
+            else if (IsComputeQueue(operation.queue)) ++computeFrameBatchCount;
             else if (IsCopyQueue(operation.queue)) ++copyFrameBatchCount;
             else return base::Result<void, runtime::RuntimeError>::Failure(
                 Error("target-profile", "frame stream references a queue that is not materialized by this Executor"));
@@ -856,7 +972,6 @@ private:
                 if (SUCCEEDED(hr)) acceptCandidate(std::move(warp));
             }
         }
-
         if (!adapter)
             return base::Result<void, runtime::RuntimeError>::Failure(
                 Error("device/no-eligible-adapter", "no D3D12 adapter is available after excluding the removed adapter LUID"));
@@ -870,11 +985,20 @@ private:
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_));
         if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-queue", hr, device_.Get()));
-
-        D3D12_COMMAND_QUEUE_DESC copyQueueDesc{};
-        copyQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-        hr = device_->CreateCommandQueue(&copyQueueDesc, IID_PPV_ARGS(&copyQueue_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-queue", hr, device_.Get()));
+        if (HasComputeQueue())
+        {
+            D3D12_COMMAND_QUEUE_DESC computeDesc{};
+            computeDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            hr = device_->CreateCommandQueue(&computeDesc, IID_PPV_ARGS(&computeQueue_));
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-compute-queue", hr, device_.Get()));
+        }
+        if (HasCopyQueue())
+        {
+            D3D12_COMMAND_QUEUE_DESC copyDesc{};
+            copyDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+            hr = device_->CreateCommandQueue(&copyDesc, IID_PPV_ARGS(&copyQueue_));
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-queue", hr, device_.Get()));
+        }
 
         const auto width = std::max(1u, surface_->ClientWidth());
         const auto height = std::max(1u, surface_->ClientHeight());
@@ -893,59 +1017,69 @@ private:
         hr = swapChain1.As(&swapChain_);
         if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("surface/query-swap-chain3", hr, device_.Get()));
 
-        hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-command-allocator", hr, device_.Get()));
-        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator_.Get(), nullptr, IID_PPV_ARGS(&commandList_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-command-list", hr, device_.Get()));
-        hr = commandList_->Close();
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/close-initial-command-list", hr, device_.Get()));
-
-        hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&copyAllocator_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-command-allocator", hr, device_.Get()));
-        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, copyAllocator_.Get(), nullptr, IID_PPV_ARGS(&copyCommandList_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-command-list", hr, device_.Get()));
-        hr = copyCommandList_->Close();
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/close-initial-copy-command-list", hr, device_.Get()));
+        const auto loadQueue = LoadQueueId();
+        const auto loadType = NativeCommandListType(loadQueue);
+        hr = device_->CreateCommandAllocator(loadType, IID_PPV_ARGS(&loadAllocator_));
+        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-load-command-allocator", hr, device_.Get()));
+        hr = device_->CreateCommandList(0, loadType, loadAllocator_.Get(), nullptr, IID_PPV_ARGS(&loadCommandList_));
+        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-load-command-list", hr, device_.Get()));
+        hr = loadCommandList_->Close();
+        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/close-load-command-list", hr, device_.Get()));
 
         frameAllocators_.resize(view_.Profile().framesInFlight);
         frameCommandLists_.resize(view_.Profile().framesInFlight);
+        computeFrameAllocators_.resize(view_.Profile().framesInFlight);
+        computeFrameCommandLists_.resize(view_.Profile().framesInFlight);
         copyFrameAllocators_.resize(view_.Profile().framesInFlight);
         copyFrameCommandLists_.resize(view_.Profile().framesInFlight);
+        const auto createBatches = [&](std::uint32_t slot, D3D12_COMMAND_LIST_TYPE type, std::uint32_t count,
+            auto& allocators, auto& lists, const char* allocatorStage, const char* listStage, const char* closeStage)
+            -> base::Result<void, runtime::RuntimeError>
+        {
+            allocators[slot].resize(count);
+            lists[slot].resize(count);
+            for (std::uint32_t batch = 0; batch < count; ++batch)
+            {
+                HRESULT local = device_->CreateCommandAllocator(type, IID_PPV_ARGS(&allocators[slot][batch]));
+                if (FAILED(local)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError(allocatorStage, local, device_.Get()));
+                local = device_->CreateCommandList(0, type, allocators[slot][batch].Get(), nullptr, IID_PPV_ARGS(&lists[slot][batch]));
+                if (FAILED(local)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError(listStage, local, device_.Get()));
+                local = lists[slot][batch]->Close();
+                if (FAILED(local)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError(closeStage, local, device_.Get()));
+            }
+            return base::Result<void, runtime::RuntimeError>::Success();
+        };
         for (std::uint32_t slot = 0; slot < view_.Profile().framesInFlight; ++slot)
         {
-            frameAllocators_[slot].resize(directFrameBatchCount);
-            frameCommandLists_[slot].resize(directFrameBatchCount);
-            for (std::uint32_t batch = 0; batch < directFrameBatchCount; ++batch)
-            {
-                hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frameAllocators_[slot][batch]));
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-frame-command-allocator", hr, device_.Get()));
-                hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frameAllocators_[slot][batch].Get(), nullptr, IID_PPV_ARGS(&frameCommandLists_[slot][batch]));
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-frame-command-list", hr, device_.Get()));
-                hr = frameCommandLists_[slot][batch]->Close();
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/close-frame-command-list", hr, device_.Get()));
-            }
-
-            copyFrameAllocators_[slot].resize(copyFrameBatchCount);
-            copyFrameCommandLists_[slot].resize(copyFrameBatchCount);
-            for (std::uint32_t batch = 0; batch < copyFrameBatchCount; ++batch)
-            {
-                hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&copyFrameAllocators_[slot][batch]));
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-frame-command-allocator", hr, device_.Get()));
-                hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, copyFrameAllocators_[slot][batch].Get(), nullptr, IID_PPV_ARGS(&copyFrameCommandLists_[slot][batch]));
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-frame-command-list", hr, device_.Get()));
-                hr = copyFrameCommandLists_[slot][batch]->Close();
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/close-copy-frame-command-list", hr, device_.Get()));
-            }
+            auto created = createBatches(slot, D3D12_COMMAND_LIST_TYPE_DIRECT, directFrameBatchCount,
+                frameAllocators_, frameCommandLists_, "device/create-frame-command-allocator", "device/create-frame-command-list", "device/close-frame-command-list");
+            if (!created) return created;
+            created = createBatches(slot, D3D12_COMMAND_LIST_TYPE_COMPUTE, computeFrameBatchCount,
+                computeFrameAllocators_, computeFrameCommandLists_, "device/create-compute-frame-command-allocator", "device/create-compute-frame-command-list", "device/close-compute-frame-command-list");
+            if (!created) return created;
+            created = createBatches(slot, D3D12_COMMAND_LIST_TYPE_COPY, copyFrameBatchCount,
+                copyFrameAllocators_, copyFrameCommandLists_, "device/create-copy-frame-command-allocator", "device/create-copy-frame-command-list", "device/close-copy-frame-command-list");
+            if (!created) return created;
         }
 
         hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
         if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-fence", hr, device_.Get()));
         fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!fenceEvent_) return base::Result<void, runtime::RuntimeError>::Failure(Error("device/create-fence-event", "CreateEventW failed"));
-        hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copyFence_));
-        if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-fence", hr, device_.Get()));
-        copyFenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!copyFenceEvent_) return base::Result<void, runtime::RuntimeError>::Failure(Error("device/create-copy-fence-event", "CreateEventW failed"));
+        if (HasComputeQueue())
+        {
+            hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&computeFence_));
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-compute-fence", hr, device_.Get()));
+            computeFenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!computeFenceEvent_) return base::Result<void, runtime::RuntimeError>::Failure(Error("device/create-compute-fence-event", "CreateEventW failed"));
+        }
+        if (HasCopyQueue())
+        {
+            hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copyFence_));
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("device/create-copy-fence", hr, device_.Get()));
+            copyFenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!copyFenceEvent_) return base::Result<void, runtime::RuntimeError>::Failure(Error("device/create-copy-fence-event", "CreateEventW failed"));
+        }
         return base::Result<void, runtime::RuntimeError>::Success();
     }
 
@@ -964,13 +1098,13 @@ private:
         }
         case pkg::D3D12OperationCode::BeginQueueBatch:
         {
-            if (!IsCopyQueue(operation.queue) || !operation.payload.empty() || copyLoadBatchOpen_ || copyLoadBatchClosed_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/BeginQueueBatch", "Copy queue batch contract is invalid"));
-            HRESULT hr = copyAllocator_->Reset();
-            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/reset-copy-allocator", hr, device_.Get()));
-            hr = copyCommandList_->Reset(copyAllocator_.Get(), nullptr);
-            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/reset-copy-command-list", hr, device_.Get()));
-            copyLoadBatchOpen_ = true;
+            if (operation.queue != LoadQueueId() || !operation.payload.empty() || loadBatchOpen_ || loadBatchClosed_)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/BeginQueueBatch", "Package-declared load queue batch contract is invalid"));
+            HRESULT hr = loadAllocator_->Reset();
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/reset-allocator", hr, device_.Get()));
+            hr = loadCommandList_->Reset(loadAllocator_.Get(), nullptr);
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/reset-command-list", hr, device_.Get()));
+            loadBatchOpen_ = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::UploadBuffer:
@@ -989,30 +1123,32 @@ private:
         {
             auto payload = pkg::DecodeInitializeState(operation.payload);
             if (!payload) return PackageFailure("load/InitializeState", payload.Error());
-            if (!copyLoadBatchOpen_ || !IsCopyQueue(operation.queue) ||
-                !IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))
-                return base::Result<void, runtime::RuntimeError>::Failure(
-                    Error("load/InitializeState", "Copy queue transition must use only Common, CopySource, or CopyDestination"));
+            if (!loadBatchOpen_ || operation.queue != LoadQueueId())
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/InitializeState", "Package-declared load queue batch is not open"));
+            if (IsCopyQueue(operation.queue) && (!IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after)))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/InitializeState", "Copy queue transition uses a state unsupported by D3D12 Copy queues"));
             const auto& artifact = view_.Resources()[payload.Value().resource.value];
             if (IsTemporal(artifact))
             {
                 for (std::uint32_t instanceIndex = 0; instanceIndex < artifact.physicalInstanceCount; ++instanceIndex)
                 {
                     auto transitioned = TransitionResourceAt(payload.Value().resource, instanceIndex,
-                        payload.Value().before, payload.Value().after, copyCommandList_.Get());
+                        payload.Value().before, payload.Value().after, loadCommandList_.Get(),
+                        NativeCommandListType(operation.queue));
                     if (!transitioned) return transitioned;
                 }
                 return base::Result<void, runtime::RuntimeError>::Success();
             }
-            return TransitionResource(payload.Value().resource, payload.Value().before, payload.Value().after, copyCommandList_.Get());
+            return TransitionResource(payload.Value().resource, payload.Value().before, payload.Value().after,
+                loadCommandList_.Get(), NativeCommandListType(operation.queue));
         }
         case pkg::D3D12OperationCode::ActivateAlias:
         {
             auto payload = pkg::DecodeActivateAlias(operation.payload);
             if (!payload) return PackageFailure("load/ActivateAlias", payload.Error());
-            if (!copyLoadBatchOpen_ || !IsCopyQueue(operation.queue))
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/ActivateAlias", "Copy queue load batch is not open"));
-            return ActivateAlias(payload.Value(), copyCommandList_.Get());
+            if (!loadBatchOpen_ || operation.queue != LoadQueueId())
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/ActivateAlias", "Package-declared load queue batch is not open"));
+            return ActivateAlias(payload.Value(), loadCommandList_.Get());
         }
         case pkg::D3D12OperationCode::VerifyBufferContents:
         {
@@ -1034,31 +1170,31 @@ private:
         }
         case pkg::D3D12OperationCode::EndQueueBatch:
         {
-            if (!copyLoadBatchOpen_ || !IsCopyQueue(operation.queue) || !operation.payload.empty())
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/EndQueueBatch", "Copy queue batch is not open"));
-            const HRESULT hr = copyCommandList_->Close();
-            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/close-copy-command-list", hr, device_.Get()));
-            copyLoadBatchOpen_ = false;
-            copyLoadBatchClosed_ = true;
+            if (!loadBatchOpen_ || operation.queue != LoadQueueId() || !operation.payload.empty())
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/EndQueueBatch", "Package-declared load queue batch is not open"));
+            const HRESULT hr = loadCommandList_->Close();
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/close-command-list", hr, device_.Get()));
+            loadBatchOpen_ = false;
+            loadBatchClosed_ = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::SignalQueue:
         {
-            if (!copyLoadBatchClosed_ || !IsCopyQueue(operation.queue) || !operation.payload.empty() || copyQueueLoadCompleted_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/SignalQueue", "Copy queue batch has not been closed"));
-            ID3D12CommandList* lists[] = {copyCommandList_.Get()};
-            copyQueue_->ExecuteCommandLists(1, lists);
-            const auto value = copyNextFenceValue_++;
-            HRESULT hr = copyQueue_->Signal(copyFence_.Get(), value);
-            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/signal-copy-queue", hr, device_.Get()));
-            copyLastFenceValue_ = value;
-            if (copyFence_->GetCompletedValue() < value)
-            {
-                hr = copyFence_->SetEventOnCompletion(value, copyFenceEvent_);
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/set-copy-fence-event", hr, device_.Get()));
-                WaitForSingleObject(copyFenceEvent_, INFINITE);
-            }
-            copyQueueLoadCompleted_ = true;
+            const auto loadQueue = LoadQueueId();
+            if (!loadBatchClosed_ || operation.queue != loadQueue || !operation.payload.empty() || loadQueueCompleted_)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/SignalQueue", "Package-declared load queue batch has not been closed"));
+            ID3D12CommandList* lists[] = {loadCommandList_.Get()};
+            NativeQueue(loadQueue)->ExecuteCommandLists(1, lists);
+            const auto value = NextFenceValue(loadQueue);
+            HRESULT hr = NativeQueue(loadQueue)->Signal(NativeFence(loadQueue), value);
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/signal-queue", hr, device_.Get()));
+            SetFrameFenceValue(loadQueue, value);
+            auto waited = WaitForQueueFence(loadQueue, value);
+            if (!waited) return waited;
+            frameFenceValue_ = 0;
+            computeFrameFenceValue_ = 0;
+            copyFrameFenceValue_ = 0;
+            loadQueueCompleted_ = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::CreateRootSignature:
@@ -1155,15 +1291,14 @@ private:
         }
         case pkg::D3D12OperationCode::BeginQueueBatch:
         {
-            if (!operation.payload.empty())
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "payload must be empty"));
+            if (!operation.payload.empty() || !IsSupportedQueue(operation.queue))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "payload or Package queue is invalid"));
             if (IsCopyQueue(operation.queue))
             {
                 if (copyFrameCommandOpen_ || copyFrameBatchCursor_ >= copyFrameAllocators_[currentFrameSlot_].size())
                     return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "Copy queue batch state exceeds the Package-declared frame stream"));
                 copyAllocator_ = copyFrameAllocators_[currentFrameSlot_][copyFrameBatchCursor_];
-                copyCommandList_ = copyFrameCommandLists_[currentFrameSlot_][copyFrameBatchCursor_];
-                ++copyFrameBatchCursor_;
+                copyCommandList_ = copyFrameCommandLists_[currentFrameSlot_][copyFrameBatchCursor_++];
                 HRESULT hr = copyAllocator_->Reset();
                 if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/reset-copy-allocator", hr, device_.Get()));
                 hr = copyCommandList_->Reset(copyAllocator_.Get(), nullptr);
@@ -1171,21 +1306,29 @@ private:
                 copyFrameCommandOpen_ = true;
                 return base::Result<void, runtime::RuntimeError>::Success();
             }
+            if (commandOpen_)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "another Direct/Compute queue batch is already open"));
             if (IsDirectQueue(operation.queue))
             {
-                if (commandOpen_ || directFrameBatchCursor_ >= frameAllocators_[currentFrameSlot_].size())
+                if (directFrameBatchCursor_ >= frameAllocators_[currentFrameSlot_].size())
                     return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "Direct queue batch state exceeds the Package-declared frame stream"));
                 allocator_ = frameAllocators_[currentFrameSlot_][directFrameBatchCursor_];
-                commandList_ = frameCommandLists_[currentFrameSlot_][directFrameBatchCursor_];
-                ++directFrameBatchCursor_;
-                HRESULT hr = allocator_->Reset();
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/reset-allocator", hr, device_.Get()));
-                hr = commandList_->Reset(allocator_.Get(), nullptr);
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/reset-command-list", hr, device_.Get()));
-                commandOpen_ = true;
-                return base::Result<void, runtime::RuntimeError>::Success();
+                commandList_ = frameCommandLists_[currentFrameSlot_][directFrameBatchCursor_++];
             }
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "Package references an unsupported queue"));
+            else
+            {
+                if (computeFrameBatchCursor_ >= computeFrameAllocators_[currentFrameSlot_].size())
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/BeginQueueBatch", "Compute queue batch state exceeds the Package-declared frame stream"));
+                allocator_ = computeFrameAllocators_[currentFrameSlot_][computeFrameBatchCursor_];
+                commandList_ = computeFrameCommandLists_[currentFrameSlot_][computeFrameBatchCursor_++];
+            }
+            HRESULT hr = allocator_->Reset();
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/reset-allocator", hr, device_.Get()));
+            hr = commandList_->Reset(allocator_.Get(), nullptr);
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/reset-command-list", hr, device_.Get()));
+            commandOpen_ = true;
+            activeCommandQueue_ = operation.queue.value;
+            return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::Transition:
         {
@@ -1197,33 +1340,36 @@ private:
             if (IsCopyQueue(operation.queue) && copyFrameCommandOpen_)
             {
                 if (!IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))
-                    return base::Result<void, runtime::RuntimeError>::Failure(
-                        Error("frame/Transition", "Copy queue transition must use only Common, CopySource, or CopyDestination"));
-                return TransitionResource(resourceView, payload.Value().before, payload.Value().after, copyCommandList_.Get());
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/Transition", "Copy queue transition uses a state unsupported by D3D12 Copy queues"));
+                return TransitionResource(resourceView, payload.Value().before, payload.Value().after,
+                    copyCommandList_.Get(), NativeCommandListType(operation.queue));
             }
-            if (IsDirectQueue(operation.queue) && commandOpen_)
-                return TransitionResource(resourceView, payload.Value().before, payload.Value().after, commandList_.Get());
+            if (commandOpen_ && activeCommandQueue_ == operation.queue.value && (IsDirectQueue(operation.queue) || IsComputeQueue(operation.queue)))
+                return TransitionResource(resourceView, payload.Value().before, payload.Value().after,
+                    commandList_.Get(), NativeCommandListType(operation.queue));
             return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/Transition", "operation is outside its Package-declared queue batch"));
         }
         case pkg::D3D12OperationCode::ExecuteCopy:
         {
-            if (!IsCopyQueue(operation.queue) || !copyFrameCommandOpen_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCopy", "Package-declared Copy queue batch is not open"));
+            const bool copyBatch = IsCopyQueue(operation.queue) && copyFrameCommandOpen_;
+            const bool directBatch = IsDirectQueue(operation.queue) && commandOpen_ && activeCommandQueue_ == operation.queue.value;
+            if (!copyBatch && !directBatch)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCopy", "Package-declared Copy-capable queue batch is not open"));
             auto payload = pkg::DecodeCopyBuffer(operation.payload);
             if (!payload) return PackageFailure("frame/ExecuteCopy", payload.Error());
             return ExecuteCopy(payload.Value(), "frame/ExecuteCopy");
         }
         case pkg::D3D12OperationCode::ExecuteCompute:
         {
-            if (!IsDirectQueue(operation.queue) || !commandOpen_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "Package-declared Direct queue batch is not open"));
+            if ((!IsDirectQueue(operation.queue) && !IsComputeQueue(operation.queue)) || !commandOpen_ || activeCommandQueue_ != operation.queue.value)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "Package-declared Direct/Compute queue batch is not open"));
             auto payload = pkg::DecodeExecuteCompute(operation.payload);
             if (!payload) return PackageFailure("frame/ExecuteCompute", payload.Error());
             return ExecuteCompute(payload.Value().command);
         }
         case pkg::D3D12OperationCode::ExecuteRaster:
         {
-            if (!IsDirectQueue(operation.queue) || !commandOpen_)
+            if (!IsDirectQueue(operation.queue) || !commandOpen_ || activeCommandQueue_ != operation.queue.value)
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "Package-declared Direct queue batch is not open"));
             auto payload = pkg::DecodeExecuteRaster(operation.payload);
             if (!payload) return PackageFailure("frame/ExecuteRaster", payload.Error());
@@ -1231,8 +1377,8 @@ private:
         }
         case pkg::D3D12OperationCode::EndQueueBatch:
         {
-            if (!operation.payload.empty())
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/EndQueueBatch", "payload must be empty"));
+            if (!operation.payload.empty() || !IsSupportedQueue(operation.queue))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/EndQueueBatch", "payload or Package queue is invalid"));
             if (IsCopyQueue(operation.queue))
             {
                 if (!copyFrameCommandOpen_)
@@ -1245,42 +1391,30 @@ private:
                 copyFrameSubmitted_ = true;
                 return base::Result<void, runtime::RuntimeError>::Success();
             }
-            if (IsDirectQueue(operation.queue))
-            {
-                if (!commandOpen_)
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/EndQueueBatch", "Package-declared Direct queue batch is not open"));
-                const HRESULT hr = commandList_->Close();
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/close-command-list", hr, device_.Get()));
-                commandOpen_ = false;
-                ID3D12CommandList* lists[] = {commandList_.Get()};
-                queue_->ExecuteCommandLists(1, lists);
-                directFrameSubmitted_ = true;
-                return base::Result<void, runtime::RuntimeError>::Success();
-            }
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/EndQueueBatch", "Package references an unsupported queue"));
+            if (!commandOpen_ || activeCommandQueue_ != operation.queue.value)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/EndQueueBatch", "Package-declared Direct/Compute queue batch is not open"));
+            const HRESULT hr = commandList_->Close();
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/close-command-list", hr, device_.Get()));
+            commandOpen_ = false;
+            activeCommandQueue_ = package::InvalidIndex;
+            ID3D12CommandList* lists[] = {commandList_.Get()};
+            NativeQueue(operation.queue)->ExecuteCommandLists(1, lists);
+            SetFrameQueueSubmitted(operation.queue, true);
+            return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::SignalQueue:
         {
             if (!operation.payload.empty() || !IsSupportedQueue(operation.queue))
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "payload or Package queue is invalid"));
-            if (IsDirectQueue(operation.queue))
-            {
-                if (commandOpen_ || !directFrameSubmitted_)
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "Direct queue has no closed submitted batch to order"));
-                const auto value = nextFenceValue_++;
-                const HRESULT hr = queue_->Signal(fence_.Get(), value);
-                if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/signal", hr, device_.Get()));
-                lastFenceValue_ = value;
-                frameFenceValue_ = value;
-                return base::Result<void, runtime::RuntimeError>::Success();
-            }
-            if (copyFrameCommandOpen_ || !copyFrameSubmitted_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "Copy queue has no closed submitted batch to order"));
-            const auto value = copyNextFenceValue_++;
-            const HRESULT hr = copyQueue_->Signal(copyFence_.Get(), value);
-            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/signal-copy", hr, device_.Get()));
-            copyLastFenceValue_ = value;
-            copyFrameFenceValue_ = value;
+            if ((IsCopyQueue(operation.queue) && copyFrameCommandOpen_) ||
+                ((!IsCopyQueue(operation.queue)) && commandOpen_ && activeCommandQueue_ == operation.queue.value) ||
+                !FrameQueueSubmitted(operation.queue))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "Package queue has no closed submitted batch to order"));
+            const auto value = NextFenceValue(operation.queue);
+            const HRESULT hr = NativeQueue(operation.queue)->Signal(NativeFence(operation.queue), value);
+            if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/signal-queue", hr, device_.Get()));
+            SetFrameFenceValue(operation.queue, value);
+            SetFrameQueueSubmitted(operation.queue, false);
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::WaitQueue:
@@ -1347,6 +1481,10 @@ private:
             const HRESULT hr = swapChain_->Present(1, 0);
             if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/present", hr, device_.Get()));
             surfacePresented_[slot] = true;
+            // DXGI Present is ordered on the Direct queue.  The following Package
+            // SignalQueue must therefore be allowed to fence presentation work even
+            // though no new command-list batch was closed after the preceding signal.
+            SetFrameQueueSubmitted(DirectQueueId(), true);
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         default:
@@ -1711,8 +1849,8 @@ private:
 
     base::Result<void, runtime::RuntimeError> UploadBuffer(const pkg::UploadBufferPayload& payload)
     {
-        if (!copyLoadBatchOpen_)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadBuffer", "Copy queue batch is not open"));
+        if (!loadBatchOpen_)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadBuffer", "Package-declared load queue batch is not open"));
         if (!payload.resource.IsValid() || payload.resource.value >= resources_.size())
             return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadBuffer", "destination resource is invalid"));
         const auto& artifact = view_.Resources()[payload.resource.value];
@@ -1753,7 +1891,7 @@ private:
             ID3D12Resource* destination = ResourceObjectAt(payload.resource, instanceIndex);
             if (!destination)
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadBuffer", "destination resource instance is unavailable"));
-            copyCommandList_->CopyBufferRegion(destination, 0, upload.Get(), 0, payload.bytes);
+            loadCommandList_->CopyBufferRegion(destination, 0, upload.Get(), 0, payload.bytes);
         }
         uploadResources_.push_back(std::move(upload));
         return base::Result<void, runtime::RuntimeError>::Success();
@@ -1761,8 +1899,12 @@ private:
 
     base::Result<void, runtime::RuntimeError> ExecuteCopy(const pkg::CopyBufferPayload& payload, const char* stage = "load/ExecuteCopy")
     {
-        if (!copyLoadBatchOpen_ && !copyFrameCommandOpen_)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "Copy queue batch is not open"));
+        ID3D12GraphicsCommandList* list = nullptr;
+        if (loadBatchOpen_) list = loadCommandList_.Get();
+        else if (copyFrameCommandOpen_) list = copyCommandList_.Get();
+        else if (commandOpen_ && IsDirectQueue(pkg::QueueId{activeCommandQueue_})) list = commandList_.Get();
+        if (!list)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "Package-declared Copy-capable queue batch is not open"));
         if (!payload.source.IsValid() || !payload.destination.IsValid() ||
             payload.source.value >= resources_.size() || payload.destination.value >= resources_.size() ||
             ResourceObject(payload.source) == nullptr || ResourceObject(payload.destination) == nullptr || payload.bytes == 0)
@@ -1777,8 +1919,7 @@ private:
         const pkg::ResourceState copyDestinationState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopyDestination)};
         if (TrackedState(payload.source) != copySourceState || TrackedState(payload.destination) != copyDestinationState)
             return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "copy resources are not in Package-planned states"));
-        copyCommandList_->CopyBufferRegion(
-            ResourceObject(payload.destination), payload.destinationOffset,
+        list->CopyBufferRegion(ResourceObject(payload.destination), payload.destinationOffset,
             ResourceObject(payload.source), payload.sourceOffset, payload.bytes);
         return base::Result<void, runtime::RuntimeError>::Success();
     }
@@ -1786,8 +1927,8 @@ private:
 
     base::Result<void, runtime::RuntimeError> UploadTexture(const pkg::UploadTexturePayload& payload)
     {
-        if (!copyLoadBatchOpen_)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadTexture", "Copy queue batch is not open"));
+        if (!loadBatchOpen_)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadTexture", "Package-declared load queue batch is not open"));
         if (!payload.resource.IsValid() || payload.resource.value >= resources_.size() || ResourceObject(payload.resource) == nullptr)
             return base::Result<void, runtime::RuntimeError>::Failure(Error("load/UploadTexture", "destination texture is not materialized"));
         const auto& artifact = view_.Resources()[payload.resource.value];
@@ -1847,7 +1988,7 @@ private:
         sourceLocation.pResource = upload.Get();
         sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         sourceLocation.PlacedFootprint = footprint;
-        copyCommandList_->CopyTextureRegion(&destinationLocation, 0, 0, 0, &sourceLocation, nullptr);
+        loadCommandList_->CopyTextureRegion(&destinationLocation, 0, 0, 0, &sourceLocation, nullptr);
         uploadResources_.push_back(std::move(upload));
         return base::Result<void, runtime::RuntimeError>::Success();
     }
@@ -1898,7 +2039,7 @@ private:
                 IID_PPV_ARGS(&pending.readback));
             if (FAILED(hr))
                 return base::Result<void, runtime::RuntimeError>::Failure(HResultError("load/create-readback-buffer", hr, device_.Get()));
-            copyCommandList_->CopyBufferRegion(pending.readback.Get(), 0, source, payload.resourceOffset, payload.bytes);
+            loadCommandList_->CopyBufferRegion(pending.readback.Get(), 0, source, payload.resourceOffset, payload.bytes);
             pendingBufferVerifications_.push_back(std::move(pending));
         }
         return base::Result<void, runtime::RuntimeError>::Success();
@@ -2007,7 +2148,7 @@ private:
         source.pResource = ResourceObject(payload.resource);
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         source.SubresourceIndex = 0;
-        copyCommandList_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        loadCommandList_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         pendingTextureVerifications_.push_back(std::move(pending));
         return base::Result<void, runtime::RuntimeError>::Success();
     }
@@ -2092,7 +2233,8 @@ private:
         std::uint32_t instanceIndex,
         const pkg::ResourceState& before,
         const pkg::ResourceState& after,
-        ID3D12GraphicsCommandList* list)
+        ID3D12GraphicsCommandList* list,
+        D3D12_COMMAND_LIST_TYPE queueType)
     {
         if (!id.IsValid() || id.value >= resourceStates_.size() || instanceIndex >= resourceStates_[id.value].size())
             return base::Result<void, runtime::RuntimeError>::Failure(Error("transition", "resource instance is invalid"));
@@ -2100,8 +2242,8 @@ private:
             return base::Result<void, runtime::RuntimeError>::Failure(Error("transition", "tracked package state does not match operation before-state"));
         ID3D12Resource* resource = ResourceObjectAt(id, instanceIndex);
         if (!resource) return base::Result<void, runtime::RuntimeError>::Failure(Error("transition", "resource object is unavailable"));
-        const auto nativeBefore = ToNativeState(before);
-        const auto nativeAfter = ToNativeState(after);
+        const auto nativeBefore = ToNativeState(before, queueType);
+        const auto nativeAfter = ToNativeState(after, queueType);
         if (nativeBefore != nativeAfter)
         {
             auto barrier = TransitionBarrier(resource, nativeBefore, nativeAfter);
@@ -2115,18 +2257,20 @@ private:
         pkg::ResourceId id,
         const pkg::ResourceState& before,
         const pkg::ResourceState& after,
-        ID3D12GraphicsCommandList* list)
+        ID3D12GraphicsCommandList* list,
+        D3D12_COMMAND_LIST_TYPE queueType)
     {
-        return TransitionResourceAt(id, PhysicalInstanceIndex(id), before, after, list);
+        return TransitionResourceAt(id, PhysicalInstanceIndex(id), before, after, list, queueType);
     }
 
     base::Result<void, runtime::RuntimeError> TransitionResource(
         const pkg::ResourceViewArtifact& resourceView,
         const pkg::ResourceState& before,
         const pkg::ResourceState& after,
-        ID3D12GraphicsCommandList* list)
+        ID3D12GraphicsCommandList* list,
+        D3D12_COMMAND_LIST_TYPE queueType)
     {
-        return TransitionResourceAt(resourceView.resource, PhysicalInstanceIndex(resourceView), before, after, list);
+        return TransitionResourceAt(resourceView.resource, PhysicalInstanceIndex(resourceView), before, after, list, queueType);
     }
 
     base::Result<void, runtime::RuntimeError> CreateRootSignature(pkg::BindingLayoutId id)
@@ -2141,31 +2285,45 @@ private:
 
     base::Result<void, runtime::RuntimeError> CreateGraphicsPipeline(pkg::ExecutableId id)
     {
-        if (!id.IsValid() || id.value >= view_.Executables().size()) return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "executable ID is invalid"));
+        if (!id.IsValid() || id.value >= view_.Executables().size())
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "executable ID is invalid"));
         const auto& executable = view_.Executables()[id.value];
-        if (executable.rasterStateId != 0 || executable.blendStateId != 0 || executable.depthStateId != 1 || executable.sampleCount != 1 || executable.sampleQuality != 0 || executable.primitiveTopology != pkg::PrimitiveTopology::TriangleList || executable.primitiveTopologyType != pkg::PrimitiveTopologyType::Triangle || executable.colorFormat != pkg::Format::B8G8R8A8Unorm || executable.depthFormat != pkg::Format::D32Float || executable.colorFormatRange.count != 1)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "executable specialization is outside the fixed Slice-13 schema"));
+        const bool hasDepth = executable.depthFormat == pkg::Format::D32Float && executable.depthStateId == 1;
+        if (executable.rasterStateId != 0 || executable.blendStateId != 0 ||
+            (!hasDepth && (executable.depthFormat != pkg::Format::Unknown || executable.depthStateId != 0)) ||
+            executable.sampleCount != 1 || executable.sampleQuality != 0 ||
+            executable.primitiveTopology != pkg::PrimitiveTopology::TriangleList ||
+            executable.primitiveTopologyType != pkg::PrimitiveTopologyType::Triangle ||
+            executable.colorFormat != pkg::Format::B8G8R8A8Unorm || executable.colorFormatRange.count != 1)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "executable specialization is unsupported"));
+        if (!executable.program.IsValid() || executable.program.value >= view_.Programs().size() ||
+            !executable.bindingLayout.IsValid() || executable.bindingLayout.value >= rootSignatures_.size())
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "program or binding layout reference is invalid"));
         const auto& program = view_.Programs()[executable.program.value];
+        if (program.kind != pkg::ProgramKind::Raster || !program.vertexShader.IsValid() || !program.pixelShader.IsValid() ||
+            program.vertexShader.value >= view_.Shaders().size() || program.pixelShader.value >= view_.Shaders().size())
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "raster program contract is invalid"));
         const auto vs = view_.ResolveBlob(view_.Shaders()[program.vertexShader.value].bytecode);
         const auto ps = view_.ResolveBlob(view_.Shaders()[program.pixelShader.value].bytecode);
         if (!vs) return PackageFailure("load/CreateGraphicsPipeline/VS", vs.Error());
         if (!ps) return PackageFailure("load/CreateGraphicsPipeline/PS", ps.Error());
-        if (!rootSignatures_[executable.bindingLayout.value]) return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "root signature has not been materialized"));
+        if (!rootSignatures_[executable.bindingLayout.value])
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "root signature has not been materialized"));
 
         std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
         for (std::uint32_t i = 0; i < executable.vertexElementRange.count; ++i)
         {
             const auto& element = view_.VertexElements()[executable.vertexElementRange.first + i];
             const char* semantic = SemanticName(element.meaning);
-            if (!semantic || element.inputSlot != 0 || element.instanceStepRate != 0 || element.flags != 0) return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "vertex element is outside the fixed Slice-13 schema"));
+            if (!semantic || element.inputSlot != 0 || element.instanceStepRate != 0 || element.flags != 0)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/CreateGraphicsPipeline", "vertex element is unsupported"));
             D3D12_INPUT_ELEMENT_DESC native{};
             native.SemanticName = semantic;
             native.SemanticIndex = element.semanticIndex;
             native.Format = ToDxgi(element.format);
             native.InputSlot = element.inputSlot;
             native.AlignedByteOffset = element.alignedByteOffset;
-            native.InputSlotClass = element.instanceStepRate == 0 ? D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA : D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-            native.InstanceDataStepRate = element.instanceStepRate;
+            native.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
             inputLayout.push_back(native);
         }
 
@@ -2173,40 +2331,26 @@ private:
         desc.pRootSignature = rootSignatures_[executable.bindingLayout.value].Get();
         desc.VS = {vs.Value().data(), vs.Value().size()};
         desc.PS = {ps.Value().data(), ps.Value().size()};
-        desc.BlendState.AlphaToCoverageEnable = FALSE;
-        desc.BlendState.IndependentBlendEnable = FALSE;
         auto& rt = desc.BlendState.RenderTarget[0];
-        rt.BlendEnable = FALSE;
-        rt.LogicOpEnable = FALSE;
-        rt.SrcBlend = D3D12_BLEND_ONE;
-        rt.DestBlend = D3D12_BLEND_ZERO;
-        rt.BlendOp = D3D12_BLEND_OP_ADD;
-        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-        rt.DestBlendAlpha = D3D12_BLEND_ZERO;
-        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
-        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        rt.SrcBlend = D3D12_BLEND_ONE; rt.DestBlend = D3D12_BLEND_ZERO; rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE; rt.DestBlendAlpha = D3D12_BLEND_ZERO; rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP; rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        desc.RasterizerState.FrontCounterClockwise = FALSE;
         desc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
         desc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
         desc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
         desc.RasterizerState.DepthClipEnable = TRUE;
-        desc.RasterizerState.MultisampleEnable = FALSE;
-        desc.RasterizerState.AntialiasedLineEnable = FALSE;
-        desc.RasterizerState.ForcedSampleCount = 0;
-        desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-        desc.DepthStencilState.DepthEnable = TRUE;
-        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        desc.DepthStencilState.DepthEnable = hasDepth;
+        desc.DepthStencilState.DepthWriteMask = hasDepth ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         desc.DepthStencilState.StencilEnable = FALSE;
         desc.InputLayout = {inputLayout.data(), static_cast<UINT>(inputLayout.size())};
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = ToDxgi(executable.colorFormat);
-        desc.DSVFormat = ToDxgi(executable.depthFormat);
+        desc.DSVFormat = hasDepth ? ToDxgi(executable.depthFormat) : DXGI_FORMAT_UNKNOWN;
         desc.SampleDesc.Count = executable.sampleCount;
         desc.SampleDesc.Quality = executable.sampleQuality;
         const HRESULT hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelineStates_[id.value]));
@@ -2255,111 +2399,109 @@ private:
             return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "compute command ID is invalid"));
         const auto& command = view_.ComputeCommands()[id.value];
         if (!command.executable.IsValid() || command.executable.value >= view_.ComputeExecutables().size() ||
-            command.threadGroupCountX != 1 || command.threadGroupCountY != 1 || command.threadGroupCountZ != 1 || command.flags != 0)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "compute command is outside the fixed Slice-13 schema"));
+            command.threadGroupCountX == 0 || command.threadGroupCountY == 0 || command.threadGroupCountZ == 0 || command.flags != 0)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "compute command contract is invalid"));
         const auto& executable = view_.ComputeExecutables()[command.executable.value];
-        if (!computePipelineStates_[command.executable.value] || !rootSignatures_[executable.bindingLayout.value] || !shaderHeap_)
+        if (!computePipelineStates_[command.executable.value] || !rootSignatures_[executable.bindingLayout.value])
             return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "compute executable objects are not materialized"));
 
-        ID3D12DescriptorHeap* shaderHeaps[] = {shaderHeap_.Get()};
-        commandList_->SetDescriptorHeaps(1, shaderHeaps);
         commandList_->SetPipelineState(computePipelineStates_[command.executable.value].Get());
         commandList_->SetComputeRootSignature(rootSignatures_[executable.bindingLayout.value].Get());
-
-        const pkg::ResourceState shaderReadState{
-            pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::ShaderRead)};
-        const pkg::ResourceState unorderedWriteState{
-            pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::UnorderedWrite)};
         const auto& layout = view_.BindingLayouts()[executable.bindingLayout.value];
-        bool previousBound = false;
-        bool outputBound = false;
+        if (layout.descriptorRange.count != 0)
+        {
+            if (!shaderHeap_) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "shader descriptor heap is unavailable"));
+            ID3D12DescriptorHeap* heaps[] = {shaderHeap_.Get()};
+            commandList_->SetDescriptorHeaps(1, heaps);
+        }
+        const pkg::ResourceState nonPixelShaderReadState{
+            pkg::StateClass::Explicit,
+            0,
+            static_cast<std::uint32_t>(pkg::ExplicitStateBits::NonPixelShaderRead)};
+        const pkg::ResourceState unorderedWriteState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::UnorderedWrite)};
         for (std::uint32_t index = 0; index < layout.parameterRange.count; ++index)
         {
             const auto& parameter = view_.RootParameters()[layout.parameterRange.first + index];
             if (parameter.kind == pkg::RootParameterKind::ConstantBuffer)
             {
-                if (!parameter.dynamicSlot.IsValid() || parameter.dynamicSlot.value >= dynamicApplied_.size() ||
-                    !dynamicApplied_[parameter.dynamicSlot.value])
+                if (!parameter.dynamicSlot.IsValid() || parameter.dynamicSlot.value >= dynamicApplied_.size() || !dynamicApplied_[parameter.dynamicSlot.value])
                     return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "dynamic constant binding is invalid or was not applied"));
                 const auto& slot = view_.DynamicSlots()[parameter.dynamicSlot.value];
-                ID3D12Resource* constantResource = ResourceObject(slot.destinationResource);
-                if (!constantResource)
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "dynamic constant resource is unavailable"));
-                commandList_->SetComputeRootConstantBufferView(parameter.rootParameterIndex,
-                    constantResource->GetGPUVirtualAddress() + slot.destinationOffset);
+                ID3D12Resource* resource = ResourceObject(slot.destinationResource);
+                if (!resource) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "dynamic constant resource is unavailable"));
+                commandList_->SetComputeRootConstantBufferView(parameter.rootParameterIndex, resource->GetGPUVirtualAddress() + slot.destinationOffset);
             }
             else if (parameter.kind == pkg::RootParameterKind::ShaderResourceTable)
             {
                 if (!parameter.staticView.IsValid() || parameter.staticView.value >= view_.Views().size())
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "previous-frame SRV view is invalid"));
-                const auto& previousView = view_.Views()[parameter.staticView.value];
-                if (previousView.viewClass != pkg::ViewClass::ShaderResource ||
-                    (previousView.flags & static_cast<std::uint32_t>(pkg::ResourceViewFlags::TemporalPrevious)) == 0 ||
-                    TrackedState(previousView) != shaderReadState || !ResourceObject(previousView))
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "previous Temporal instance is not in ShaderRead state"));
-                auto gpuHandle = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
-                gpuHandle.ptr += static_cast<UINT64>(DescriptorIndex(previousView)) * shaderDescriptorIncrement_;
-                commandList_->SetComputeRootDescriptorTable(parameter.rootParameterIndex, gpuHandle);
-                previousBound = true;
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "shader-resource view is invalid"));
+                const auto& resourceView = view_.Views()[parameter.staticView.value];
+                if (resourceView.viewClass != pkg::ViewClass::ShaderResource || TrackedState(resourceView) != nonPixelShaderReadState || !ResourceObject(resourceView))
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "shader resource is unavailable or not in NonPixelShaderRead state"));
+                auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
+                gpu.ptr += static_cast<UINT64>(DescriptorIndex(resourceView)) * shaderDescriptorIncrement_;
+                commandList_->SetComputeRootDescriptorTable(parameter.rootParameterIndex, gpu);
             }
             else if (parameter.kind == pkg::RootParameterKind::UnorderedAccessTable)
             {
                 if (!parameter.staticView.IsValid() || parameter.staticView.value >= view_.Views().size())
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "current-frame UAV view is invalid"));
-                const auto& outputView = view_.Views()[parameter.staticView.value];
-                if (outputView.viewClass != pkg::ViewClass::UnorderedAccess ||
-                    (outputView.flags & static_cast<std::uint32_t>(pkg::ResourceViewFlags::TemporalCurrent)) == 0 ||
-                    TrackedState(outputView) != unorderedWriteState || !ResourceObject(outputView))
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "current Temporal instance is not in UnorderedWrite state"));
-                auto gpuHandle = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
-                gpuHandle.ptr += static_cast<UINT64>(DescriptorIndex(outputView)) * shaderDescriptorIncrement_;
-                commandList_->SetComputeRootDescriptorTable(parameter.rootParameterIndex, gpuHandle);
-                outputBound = true;
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "unordered-access view is invalid"));
+                const auto& resourceView = view_.Views()[parameter.staticView.value];
+                if (resourceView.viewClass != pkg::ViewClass::UnorderedAccess || TrackedState(resourceView) != unorderedWriteState || !ResourceObject(resourceView))
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "unordered resource is unavailable or not in UnorderedWrite state"));
+                auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
+                gpu.ptr += static_cast<UINT64>(DescriptorIndex(resourceView)) * shaderDescriptorIncrement_;
+                commandList_->SetComputeRootDescriptorTable(parameter.rootParameterIndex, gpu);
             }
-            else
-            {
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "root parameter kind is unsupported"));
-            }
+            else return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "root parameter kind is unsupported"));
         }
-        if (!previousBound || !outputBound)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteCompute", "Temporal previous/current bindings are incomplete"));
         commandList_->Dispatch(command.threadGroupCountX, command.threadGroupCountY, command.threadGroupCountZ);
         return base::Result<void, runtime::RuntimeError>::Success();
     }
 
     base::Result<void, runtime::RuntimeError> ExecuteRaster(pkg::RasterCommandId id)
     {
-        if (!id.IsValid() || id.value >= view_.RasterCommands().size()) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "raster command ID is invalid"));
+        if (!id.IsValid() || id.value >= view_.RasterCommands().size())
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "raster command ID is invalid"));
         const auto& command = view_.RasterCommands()[id.value];
+        if (!command.executable.IsValid() || command.executable.value >= view_.Executables().size() ||
+            !command.attachmentOperation.IsValid() || command.attachmentOperation.value >= view_.AttachmentOperations().size())
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "raster command references are invalid"));
         const auto& executable = view_.Executables()[command.executable.value];
         const auto& attachment = view_.AttachmentOperations()[command.attachmentOperation.value];
         if (!pipelineStates_[command.executable.value] || !rootSignatures_[executable.bindingLayout.value])
             return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "executable objects are not materialized"));
-        if (command.vertexViewRange.count != 1 || command.colorAttachmentRange.count != 1 || command.indexView.IsValid() || !command.depthAttachment.IsValid() || command.viewportId != 0 || command.scissorId != 0)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "raster command is outside the fixed Slice-13 schema"));
-        if (attachment.colorLoad != pkg::AttachmentLoadOp::Clear || attachment.colorStore != pkg::AttachmentStoreOp::Store ||
-            attachment.depthLoad != pkg::AttachmentLoadOp::Clear || attachment.depthStore != pkg::AttachmentStoreOp::Store ||
-            attachment.clearDepth != 1.0f || attachment.clearStencil != 0)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "attachment operation is outside the fixed Slice-13 schema"));
+        if (command.vertexViewRange.count != 1 || command.colorAttachmentRange.count != 1 || command.indexView.IsValid() ||
+            command.viewportId != 0 || command.scissorId != 0 || command.vertexCount == 0 || command.instanceCount == 0)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "raster command contract is unsupported"));
+        if (attachment.colorLoad != pkg::AttachmentLoadOp::Clear || attachment.colorStore != pkg::AttachmentStoreOp::Store)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "color attachment operation is unsupported"));
 
         const auto& vertexView = view_.Views()[command.vertexViewRange.first];
         const auto& colorView = view_.Views()[command.colorAttachmentRange.first];
-        const auto& depthView = view_.Views()[command.depthAttachment.value];
-        if (vertexView.viewClass != pkg::ViewClass::VertexBuffer || colorView.viewClass != pkg::ViewClass::RenderTarget ||
-            depthView.viewClass != pkg::ViewClass::DepthStencil)
+        if (vertexView.viewClass != pkg::ViewClass::VertexBuffer || colorView.viewClass != pkg::ViewClass::RenderTarget)
             return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "command view classes are invalid"));
-        const pkg::ResourceState vertexBufferState{
-            pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::VertexBuffer)};
-        const pkg::ResourceState renderTargetState{
-            pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::RenderTarget)};
-        const pkg::ResourceState depthWriteState{
-            pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::DepthWrite)};
-        if (TrackedState(vertexView) != vertexBufferState)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "vertex input is not in the Package-planned VertexBuffer state"));
-        if (TrackedState(colorView) != renderTargetState)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "color attachment is not in the Package-planned RenderTarget state"));
-        if (TrackedState(depthView) != depthWriteState)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "depth attachment is not in the Package-planned DepthWrite state"));
+        const bool hasDepth = command.depthAttachment.IsValid();
+        const pkg::ResourceViewArtifact* depthView = nullptr;
+        if (hasDepth)
+        {
+            if (command.depthAttachment.value >= view_.Views().size())
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "depth view is invalid"));
+            depthView = &view_.Views()[command.depthAttachment.value];
+            if (depthView->viewClass != pkg::ViewClass::DepthStencil ||
+                attachment.depthLoad != pkg::AttachmentLoadOp::Clear || attachment.depthStore != pkg::AttachmentStoreOp::Store)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "depth attachment contract is invalid"));
+        }
+        else if (attachment.depthLoad != pkg::AttachmentLoadOp::Discard || attachment.depthStore != pkg::AttachmentStoreOp::Discard)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "absent depth attachment must use Discard operations"));
+
+        const pkg::ResourceState vertexState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::VertexBuffer)};
+        const pkg::ResourceState renderTargetState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::RenderTarget)};
+        const pkg::ResourceState depthState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::DepthWrite)};
+        if (TrackedState(vertexView) != vertexState || TrackedState(colorView) != renderTargetState)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "vertex or color resource is not in its Package-planned state"));
+        if (depthView && TrackedState(*depthView) != depthState)
+            return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "depth resource is not in DepthWrite state"));
         ID3D12Resource* vertexResource = ResourceObject(vertexView);
         if (!vertexResource) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "vertex resource is unavailable"));
 
@@ -2369,27 +2511,37 @@ private:
         vbv.StrideInBytes = vertexView.strideBytes;
         auto rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += static_cast<SIZE_T>(currentBackBuffer_) * rtvIncrement_;
-        auto dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
-        dsv.ptr += static_cast<SIZE_T>(depthView.descriptorIndex) * dsvIncrement_;
-        commandList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        if (attachment.colorLoad == pkg::AttachmentLoadOp::Clear) commandList_->ClearRenderTargetView(rtv, attachment.clearColor.data(), 0, nullptr);
-        if (attachment.depthLoad == pkg::AttachmentLoadOp::Clear)
-            commandList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, attachment.clearDepth, static_cast<UINT8>(attachment.clearStencil), 0, nullptr);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        if (depthView)
+        {
+            dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+            dsv.ptr += static_cast<SIZE_T>(DescriptorIndex(*depthView)) * dsvIncrement_;
+            commandList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        }
+        else commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        commandList_->ClearRenderTargetView(rtv, attachment.clearColor.data(), 0, nullptr);
+        if (depthView) commandList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, attachment.clearDepth, static_cast<UINT8>(attachment.clearStencil), 0, nullptr);
 
         D3D12_VIEWPORT viewport{};
         viewport.Width = static_cast<float>(std::max(1u, surface_->ClientWidth()));
         viewport.Height = static_cast<float>(std::max(1u, surface_->ClientHeight()));
-        viewport.MinDepth = 0.0f;
-        viewport.MaxDepth = 1.0f;
+        viewport.MinDepth = 0.0f; viewport.MaxDepth = 1.0f;
         D3D12_RECT scissor{0, 0, static_cast<LONG>(std::max(1u, surface_->ClientWidth())), static_cast<LONG>(std::max(1u, surface_->ClientHeight()))};
         commandList_->RSSetViewports(1, &viewport);
         commandList_->RSSetScissorRects(1, &scissor);
         commandList_->SetPipelineState(pipelineStates_[command.executable.value].Get());
         commandList_->SetGraphicsRootSignature(rootSignatures_[executable.bindingLayout.value].Get());
-        if (!shaderHeap_) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "shader descriptor heap is unavailable"));
-        ID3D12DescriptorHeap* shaderHeaps[] = {shaderHeap_.Get()};
-        commandList_->SetDescriptorHeaps(1, shaderHeaps);
         const auto& layout = view_.BindingLayouts()[executable.bindingLayout.value];
+        if (layout.descriptorRange.count != 0)
+        {
+            if (!shaderHeap_) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "shader descriptor heap is unavailable"));
+            ID3D12DescriptorHeap* heaps[] = {shaderHeap_.Get()};
+            commandList_->SetDescriptorHeaps(1, heaps);
+        }
+        const pkg::ResourceState pixelShaderReadState{
+            pkg::StateClass::Explicit,
+            0,
+            static_cast<std::uint32_t>(pkg::ExplicitStateBits::PixelShaderRead)};
         for (std::uint32_t i = 0; i < layout.parameterRange.count; ++i)
         {
             const auto& parameter = view_.RootParameters()[layout.parameterRange.first + i];
@@ -2398,28 +2550,22 @@ private:
                 if (!parameter.dynamicSlot.IsValid() || parameter.dynamicSlot.value >= dynamicApplied_.size() || !dynamicApplied_[parameter.dynamicSlot.value])
                     return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "dynamic constant binding is invalid or was not applied"));
                 const auto& slot = view_.DynamicSlots()[parameter.dynamicSlot.value];
-                ID3D12Resource* constantResource = ResourceObject(slot.destinationResource);
-                if (!constantResource)
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "dynamic constant resource is unavailable"));
-                commandList_->SetGraphicsRootConstantBufferView(parameter.rootParameterIndex,
-                    constantResource->GetGPUVirtualAddress() + slot.destinationOffset);
+                ID3D12Resource* resource = ResourceObject(slot.destinationResource);
+                if (!resource) return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "dynamic constant resource is unavailable"));
+                commandList_->SetGraphicsRootConstantBufferView(parameter.rootParameterIndex, resource->GetGPUVirtualAddress() + slot.destinationOffset);
             }
             else if (parameter.kind == pkg::RootParameterKind::ShaderResourceTable)
             {
                 if (!parameter.staticView.IsValid() || parameter.staticView.value >= view_.Views().size())
                     return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "static shader-resource view is invalid"));
-                const auto& shaderResourceView = view_.Views()[parameter.staticView.value];
-                const pkg::ResourceState shaderReadState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::ShaderRead)};
-                if (shaderResourceView.viewClass != pkg::ViewClass::ShaderResource || TrackedState(shaderResourceView) != shaderReadState)
-                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "shader resource is not in the Package-planned ShaderRead state"));
-                auto gpuHandle = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
-                gpuHandle.ptr += static_cast<UINT64>(DescriptorIndex(shaderResourceView)) * shaderDescriptorIncrement_;
-                commandList_->SetGraphicsRootDescriptorTable(parameter.rootParameterIndex, gpuHandle);
+                const auto& resourceView = view_.Views()[parameter.staticView.value];
+                if (resourceView.viewClass != pkg::ViewClass::ShaderResource || TrackedState(resourceView) != pixelShaderReadState || !ResourceObject(resourceView))
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "shader resource is unavailable or not in PixelShaderRead state"));
+                auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
+                gpu.ptr += static_cast<UINT64>(DescriptorIndex(resourceView)) * shaderDescriptorIncrement_;
+                commandList_->SetGraphicsRootDescriptorTable(parameter.rootParameterIndex, gpu);
             }
-            else
-            {
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "root parameter kind is unsupported"));
-            }
+            else return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ExecuteRaster", "root parameter kind is unsupported"));
         }
         commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         commandList_->IASetVertexBuffers(0, 1, &vbv);
@@ -2499,6 +2645,7 @@ private:
     ComPtr<IDXGIFactory6> factory_;
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
+    ComPtr<ID3D12CommandQueue> computeQueue_;
     ComPtr<ID3D12CommandQueue> copyQueue_;
     ComPtr<IDXGISwapChain3> swapChain_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
@@ -2531,13 +2678,19 @@ private:
     ComPtr<ID3D12GraphicsCommandList> commandList_;
     ComPtr<ID3D12CommandAllocator> copyAllocator_;
     ComPtr<ID3D12GraphicsCommandList> copyCommandList_;
+    ComPtr<ID3D12CommandAllocator> loadAllocator_;
+    ComPtr<ID3D12GraphicsCommandList> loadCommandList_;
     std::vector<std::vector<ComPtr<ID3D12CommandAllocator>>> frameAllocators_;
     std::vector<std::vector<ComPtr<ID3D12GraphicsCommandList>>> frameCommandLists_;
+    std::vector<std::vector<ComPtr<ID3D12CommandAllocator>>> computeFrameAllocators_;
+    std::vector<std::vector<ComPtr<ID3D12GraphicsCommandList>>> computeFrameCommandLists_;
     std::vector<std::vector<ComPtr<ID3D12CommandAllocator>>> copyFrameAllocators_;
     std::vector<std::vector<ComPtr<ID3D12GraphicsCommandList>>> copyFrameCommandLists_;
     ComPtr<ID3D12Fence> fence_;
+    ComPtr<ID3D12Fence> computeFence_;
     ComPtr<ID3D12Fence> copyFence_;
     HANDLE fenceEvent_ = nullptr;
+    HANDLE computeFenceEvent_ = nullptr;
     HANDLE copyFenceEvent_ = nullptr;
     UINT rtvIncrement_ = 0;
     UINT dsvIncrement_ = 0;
@@ -2545,30 +2698,38 @@ private:
     UINT currentBackBuffer_ = 0;
     std::uint64_t nextFenceValue_ = 1;
     std::uint64_t lastFenceValue_ = 0;
+    std::uint64_t computeNextFenceValue_ = 1;
+    std::uint64_t computeLastFenceValue_ = 0;
     std::uint64_t copyNextFenceValue_ = 1;
     std::uint64_t copyLastFenceValue_ = 0;
     std::uint64_t frameFenceValue_ = 0;
+    std::uint64_t computeFrameFenceValue_ = 0;
     std::uint64_t copyFrameFenceValue_ = 0;
     std::vector<std::uint64_t> frameSlotFenceValues_;
+    std::vector<std::uint64_t> computeFrameSlotFenceValues_;
     std::vector<std::uint64_t> copyFrameSlotFenceValues_;
     std::uint32_t currentFrameSlot_ = 0;
     std::uint32_t temporalPreviousInstance_ = 1;
     std::uint32_t temporalCurrentInstance_ = 0;
     std::uint64_t temporalDependencyFenceValue_ = 0;
     std::uint64_t previousDirectFenceValue_ = 0;
+    std::uint64_t previousComputeFenceValue_ = 0;
     std::uint64_t previousCopyFenceValue_ = 0;
     std::uint64_t lastSubmittedFrameNumber_ = 0;
     bool hasSubmittedFrame_ = false;
     bool descriptorHeapsCreated_ = false;
     bool commandOpen_ = false;
+    std::uint32_t activeCommandQueue_ = package::InvalidIndex;
     bool directFrameSubmitted_ = false;
+    bool computeFrameSubmitted_ = false;
     bool copyFrameCommandOpen_ = false;
     bool copyFrameSubmitted_ = false;
     std::uint32_t directFrameBatchCursor_ = 0;
+    std::uint32_t computeFrameBatchCursor_ = 0;
     std::uint32_t copyFrameBatchCursor_ = 0;
-    bool copyLoadBatchOpen_ = false;
-    bool copyLoadBatchClosed_ = false;
-    bool copyQueueLoadCompleted_ = false;
+    bool loadBatchOpen_ = false;
+    bool loadBatchClosed_ = false;
+    bool loadQueueCompleted_ = false;
 };
 }
 

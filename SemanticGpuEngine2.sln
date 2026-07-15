@@ -50,6 +50,8 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "35_D3D12ReadbackTests", "35
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "36_Level1ScenarioTests", "36_Level1ScenarioTests\36_Level1ScenarioTests.vcxproj", "{2F6A3D4E-9D5B-4D26-A0C2-36E15A7B9136}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "37_Level1ExecutionTests", "37_Level1ExecutionTests\37_Level1ExecutionTests.vcxproj", "{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}"
+EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "40_Launcher", "40_Launcher\40_Launcher.vcxproj", "{ADA94B9E-8FBE-5406-A7A8-4EE888BDCA5E}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "41_PackageCompiler", "41_PackageCompiler\41_PackageCompiler.vcxproj", "{63825FD2-9A95-58AD-B4D5-BF5249EB5E1A}"
@@ -164,6 +166,10 @@ Global
 		{2F6A3D4E-9D5B-4D26-A0C2-36E15A7B9136}.Debug|x64.Build.0 = Debug|x64
 		{2F6A3D4E-9D5B-4D26-A0C2-36E15A7B9136}.Release|x64.ActiveCfg = Release|x64
 		{2F6A3D4E-9D5B-4D26-A0C2-36E15A7B9136}.Release|x64.Build.0 = Release|x64
+		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Debug|x64.ActiveCfg = Debug|x64
+		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Debug|x64.Build.0 = Debug|x64
+		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Release|x64.ActiveCfg = Release|x64
+		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

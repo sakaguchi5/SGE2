@@ -74,6 +74,24 @@ bool HasOperationOnQueue(
         });
 }
 
+bool HasTransitionAfterState(
+    std::span<const pkg::OperationView> operations,
+    std::uint32_t queue,
+    pkg::ExplicitStateBits state)
+{
+    const auto expected = pkg::ResourceState{pkg::StateClass::Explicit, 0,
+        static_cast<std::uint32_t>(state)};
+    for (const auto& operation : operations)
+    {
+        if (operation.opcode != pkg::D3D12OperationCode::Transition ||
+            !operation.queue.IsValid() || operation.queue.value != queue)
+            continue;
+        auto payload = pkg::DecodeTransition(operation.payload);
+        if (payload && payload.Value().after == expected) return true;
+    }
+    return false;
+}
+
 int ValidateGraph(const lvl::ScenarioInput& input)
 {
     const auto& graph = input.graph;
@@ -197,6 +215,13 @@ int ValidatePackage(
         {
             std::cerr << input.name << ": multiple-queue handoffs were not fixed into the Package\n";
             return 4;
+        }
+        if (!HasTransitionAfterState(frame, 0, pkg::ExplicitStateBits::PixelShaderRead) ||
+            (expected.temporal &&
+             !HasTransitionAfterState(frame, computeQueue, pkg::ExplicitStateBits::NonPixelShaderRead)))
+        {
+            std::cerr << input.name << ": shader-read stage scope was not fixed into the Package\n";
+            return 6;
         }
     }
 

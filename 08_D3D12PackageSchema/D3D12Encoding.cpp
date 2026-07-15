@@ -17,8 +17,8 @@ namespace sge::package::d3d12_v13
 {
 namespace
 {
-constexpr std::uint32_t TargetSchemaVersion = 13;
-constexpr std::uint32_t MinimumRuntimeVersion = 13;
+constexpr std::uint32_t TargetSchemaVersion = 14;
+constexpr std::uint32_t MinimumRuntimeVersion = 14;
 constexpr std::uint32_t ManifestStride = 72;
 constexpr std::uint32_t ProfileStride = 80;
 constexpr std::uint32_t ResourceStride = 96;
@@ -357,7 +357,7 @@ base::Result<TargetProfile, PackageError> DecodeProfileRecord(base::BinaryReader
         profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc ||
         profile.shaderModelMajor != 5 || profile.shaderModelMinor > 1 ||
         profile.rootSignatureMajor != 1 || profile.rootSignatureMinor > 1)
-        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v13 capability", section));
+        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v14 capability", section));
     return base::Result<TargetProfile, PackageError>::Success(profile);
 }
 
@@ -1390,7 +1390,7 @@ base::Result<void, PackageError> ValidateSliceReferences(D3D12PackageView& view)
                 "package-owned default buffers must begin in COMMON", SectionKind::D3D12ResourceTable);
     }
 
-    const auto shaderRead = ResourceState{StateClass::Explicit, 0, static_cast<std::uint32_t>(ExplicitStateBits::ShaderRead)};
+    const auto shaderRead = ResourceState{StateClass::Explicit, 0, static_cast<std::uint32_t>(ExplicitStateBits::PixelShaderRead)};
     const auto& externalResource = view.Resources()[10];
     if (externalResource.resourceKind != ResourceKind::Buffer || externalResource.origin != ResourceOrigin::External ||
         externalResource.rebuildPolicy != RebuildPolicy::RequireExternalRebind || externalResource.allocation.IsValid() ||

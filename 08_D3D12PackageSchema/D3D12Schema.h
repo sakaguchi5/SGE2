@@ -61,11 +61,14 @@ enum class ExplicitStateBits : std::uint32_t
     RenderTarget = 1u << 3,
     DepthWrite = 1u << 4,
     DepthRead = 1u << 5,
+    // Legacy stage-unspecified shader-read contract retained for old Package bytes.
     ShaderRead = 1u << 6,
     UnorderedWrite = 1u << 7,
     CopySource = 1u << 8,
     CopyDestination = 1u << 9,
-    IndirectArgument = 1u << 10
+    IndirectArgument = 1u << 10,
+    PixelShaderRead = 1u << 11,
+    NonPixelShaderRead = 1u << 12
 };
 enum class ViewClass : std::uint16_t
 {

@@ -292,7 +292,7 @@ pkg::ViewClass ViewClass(semantic::ViewRole role)
     }
 }
 
-pkg::ResourceState RequiredState(semantic::ViewRole role)
+pkg::ResourceState RequiredState(semantic::ViewRole role, semantic::WorkKind workKind)
 {
     using semantic::ViewRole;
     switch (role)
@@ -305,7 +305,12 @@ pkg::ResourceState RequiredState(semantic::ViewRole role)
     case ViewRole::CopySource: return Explicit(pkg::ExplicitStateBits::CopySource);
     case ViewRole::CopyDestination: return Explicit(pkg::ExplicitStateBits::CopyDestination);
     case ViewRole::PresentSource: return Present();
-    default: return Explicit(pkg::ExplicitStateBits::ShaderRead);
+    default:
+        // Shader visibility is an execution decision and must be frozen into the
+        // Package. Dedicated Compute queues cannot consume PIXEL_SHADER_RESOURCE.
+        return Explicit(workKind == semantic::WorkKind::Compute
+            ? pkg::ExplicitStateBits::NonPixelShaderRead
+            : pkg::ExplicitStateBits::PixelShaderRead);
     }
 }
 
@@ -393,7 +398,7 @@ base::Result<CompileOutput, CompileError> Compile(
         targetProfile.shaderModelMajor != 5 || targetProfile.shaderModelMinor > 1 ||
         targetProfile.rootSignatureMajor != 1 || targetProfile.rootSignatureMinor > 1 ||
         targetProfile.barrierModel != target::BarrierModel::Legacy || targetProfile.surfaceImageCount == 0)
-        return Failure<CompileOutput>("target-feasibility", "target profile is outside the generalized D3D12 v13 capability");
+        return Failure<CompileOutput>("target-feasibility", "target profile is outside the generalized D3D12 v14 capability");
 
     std::map<std::uint32_t, const semantic::Resource*> resources;
     std::map<std::uint32_t, const semantic::ResourceUse*> uses;
@@ -403,6 +408,11 @@ base::Result<CompileOutput, CompileError> Compile(
     for (const auto& value : graph.resourceUses) uses[value.id.value] = &value;
     for (const auto& value : graph.programs) programs[value.id.value] = &value;
     for (const auto& value : graph.works) works[value.id.value] = &value;
+
+    std::map<std::uint32_t, semantic::WorkKind> useWorkKinds;
+    for (const auto& work : graph.works)
+        for (const auto useId : work.uses)
+            useWorkKinds[useId.value] = work.kind;
 
     pkg::D3D12PackageDescription description;
     description.profile.minimumFeatureLevel = targetProfile.minimumFeatureLevel;
@@ -596,7 +606,7 @@ base::Result<CompileOutput, CompileError> Compile(
             slot.requiredFormat = ResourceFormat(source);
             slot.minimumBytes = source.kind == semantic::ResourceKind::Buffer ? source.buffer.sizeBytes : 0;
             const auto& sourceUses = resourceUses[source.id.value];
-            const auto state = sourceUses.empty() ? Common() : RequiredState(sourceUses.front()->role);
+            const auto state = sourceUses.empty() ? Common() : RequiredState(sourceUses.front()->role, useWorkKinds.at(sourceUses.front()->id.value));
             slot.requiredIncomingState = state;
             slot.guaranteedOutgoingState = state;
             description.resources[packageResource.value].initialState = state;
@@ -1136,9 +1146,9 @@ base::Result<CompileOutput, CompileError> Compile(
             if (work.kind == semantic::WorkKind::Raster && use->role == semantic::ViewRole::PresentSource)
                 continue;
             const auto cell = cellFor(*use);
-            const auto required = RequiredState(use->role);
+            const auto required = RequiredState(use->role, work.kind);
             const auto existing = activeUses.find(cell);
-            if (existing != activeUses.end() && RequiredState(existing->second->role) != required)
+            if (existing != activeUses.end() && RequiredState(existing->second->role, work.kind) != required)
                 return Failure<CompileOutput>("state-planning", "one Work requires incompatible states for the same state cell");
             activeUses[cell] = use;
             emitTransition(queue, viewMap.at(use->id.value), cell, required);
@@ -1183,7 +1193,7 @@ base::Result<CompileOutput, CompileError> Compile(
                 {
                     const auto* nextUse = uses.at(nextUseId.value);
                     if (cellFor(*nextUse) != cell) continue;
-                    desired = workQueues.at(nextWork.id.value) == queue ? RequiredState(nextUse->role) : Common();
+                    desired = workQueues.at(nextWork.id.value) == queue ? RequiredState(nextUse->role, nextWork.kind) : Common();
                     nextFound = true;
                     break;
                 }

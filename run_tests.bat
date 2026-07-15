@@ -20,11 +20,15 @@ for %%T in (30_SemanticTests 31_CompilerTests 32_PackageContractTests 33_D3D12Co
   if errorlevel 1 goto :failed
 )
 
+echo Running 37_Level1ExecutionTests with WARP...
+"%BIN%\37_Level1ExecutionTests.exe"
+if errorlevel 1 exit /b 1
+
 echo Running 35_D3D12ReadbackTests with WARP...
 "%BIN%\35_D3D12ReadbackTests.exe" "%PACKAGE%"
 if errorlevel 1 exit /b 1
 
-echo All Slice-15 and Level-1 Stage-A tests passed.
+echo All Slice-15 and Level-1 Stage-A/Stage-B tests passed.
 exit /b 0
 
 :failed
