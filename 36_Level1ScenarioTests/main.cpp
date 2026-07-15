@@ -33,12 +33,6 @@ bool HasResource(const sem::SemanticGraph& graph, const auto& predicate)
     return std::any_of(graph.resources.begin(), graph.resources.end(), predicate);
 }
 
-bool HasUse(const sem::SemanticGraph& graph, sem::ViewRole role)
-{
-    return std::any_of(graph.resourceUses.begin(), graph.resourceUses.end(),
-        [role](const auto& use) { return use.role == role; });
-}
-
 bool HasWork(const sem::SemanticGraph& graph, sem::WorkKind kind)
 {
     return std::any_of(graph.works.begin(), graph.works.end(),
@@ -147,7 +141,7 @@ int ValidateGraph(const lvl::ScenarioInput& input)
         HasWork(graph, sem::WorkKind::Copy) != expected.copyWork ||
         hasGpuFrameLocal != expected.gpuWrittenFrameLocal ||
         hasTemporal != expected.temporal ||
-        (hasPreparation && HasUse(graph, sem::ViewRole::AliasedBuffer)) != expected.aliasing ||
+        (hasPreparation && HasResource(graph, [](const auto& resource) { return resource.aliasPreparation.IsValid(); })) != expected.aliasing ||
         hasExternal != expected.externalResource)
     {
         std::cerr << input.name << ": graph features do not match the Slice contract\n";

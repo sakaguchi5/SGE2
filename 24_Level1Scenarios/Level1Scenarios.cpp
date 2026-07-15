@@ -18,13 +18,18 @@ namespace
 using semantic::Effect;
 using semantic::FormatMeaning;
 using semantic::ProgramInterface;
+using semantic::ProgramParameterKind;
 using semantic::ProgramSource;
 using semantic::ResourceId;
 using semantic::ResourceUseId;
 using semantic::SemanticBuilder;
 using semantic::SemanticGraph;
+using semantic::ShaderStage;
+using semantic::TemporalRelation;
 using semantic::VertexInput;
 using semantic::ViewRole;
+using semantic::WorkOperand;
+using semantic::WorkOperandKind;
 
 constexpr std::uint64_t FrameConstantBytes = 64;
 constexpr std::uint32_t FrameConstantAlignment = 16;
@@ -315,6 +320,8 @@ base::Result<SemanticGraph, std::string> BuildProgressiveGraph(
             "Level1AliasedColor", ColorStride, std::as_bytes(std::span(AliasedRasterColor)));
         if (!target) return Fail<SemanticGraph>(target.Error());
         aliasedColor = target.Value();
+        auto alias = builder.SetAliasPreparation(aliasedColor, preparation.Value());
+        if (!alias) return Fail<SemanticGraph>(alias.Error());
     }
 
     ResourceId externalColor;
@@ -332,70 +339,76 @@ base::Result<SemanticGraph, std::string> BuildProgressiveGraph(
     auto colorUse = builder.AddUse(surface.Value(), Effect::Write, ViewRole::ColorAttachment);
     auto presentUse = builder.AddUse(surface.Value(), Effect::Read, ViewRole::PresentSource);
     if (!vertexUse || !colorUse || !presentUse)
-        return Fail<SemanticGraph>("failed to create the base Level-1 resource uses");
-
-    std::vector<ResourceUseId> rasterUses{vertexUse.Value()};
-    if (features.dynamicData)
-    {
-        auto use = builder.AddUse(frameConstants, Effect::Read, ViewRole::ConstantData);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    if (features.texture2D)
-    {
-        auto use = builder.AddUse(texture, Effect::Read, ViewRole::SampledTexture);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    if (features.computeWork)
-    {
-        auto use = builder.AddUse(computeColor, Effect::Read, ViewRole::ComputedBuffer);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    if (features.copyWork)
-    {
-        auto use = builder.AddUse(copiedColor, Effect::Read, ViewRole::CopiedBuffer);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    if (features.aliasing)
-    {
-        auto use = builder.AddUse(aliasedColor, Effect::Read, ViewRole::AliasedBuffer);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    if (features.externalResource)
-    {
-        auto use = builder.AddUse(externalColor, Effect::Read, ViewRole::ExternalBuffer);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    rasterUses.push_back(colorUse.Value());
-    if (features.depthAttachment)
-    {
-        auto use = builder.AddUse(depth, Effect::Write, ViewRole::DepthAttachment);
-        if (!use) return Fail<SemanticGraph>(use.Error());
-        rasterUses.push_back(use.Value());
-    }
-    rasterUses.push_back(presentUse.Value());
+        return Fail<SemanticGraph>("failed to create the base Level-1 ResourceUses");
 
     ProgramInterface rasterInterface;
     rasterInterface.vertexStrideBytes = sizeof(experiment::TriangleVertex);
     rasterInterface.vertexInputs.push_back({VertexInput::Meaning::Position, 3, 0});
     rasterInterface.vertexInputs.push_back({VertexInput::Meaning::Color, 4, 12});
     rasterInterface.vertexInputs.push_back({VertexInput::Meaning::TexCoord, 2, 28});
+    std::vector<WorkOperand> rasterOperands{
+        WorkOperand{WorkOperandKind::VertexData, vertexUse.Value(), {}}};
+
+    const auto addRasterParameter = [&](std::string name, ProgramParameterKind kind,
+                                        std::uint32_t shaderRegister, ResourceUseId use,
+                                        std::uint64_t requiredBytes = 0,
+                                        std::uint32_t requiredAlignment = 1)
+    {
+        const semantic::ProgramParameterId id{static_cast<std::uint32_t>(rasterInterface.parameters.size())};
+        rasterInterface.parameters.push_back({id, std::move(name), kind,
+            kind == ProgramParameterKind::ConstantBuffer ? ShaderStage::Vertex : ShaderStage::Pixel,
+            shaderRegister, requiredBytes, requiredAlignment});
+        rasterOperands.push_back({WorkOperandKind::ProgramParameter, use, id});
+    };
+
     if (features.dynamicData)
     {
-        rasterInterface.constantDataBytes = FrameConstantBytes;
-        rasterInterface.constantDataAlignment = FrameConstantAlignment;
+        auto use = builder.AddUse(frameConstants, Effect::Read, ViewRole::ConstantData);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("FrameConstants", ProgramParameterKind::ConstantBuffer, 0, use.Value(),
+                           FrameConstantBytes, FrameConstantAlignment);
     }
-    rasterInterface.sampledTextureCount = features.texture2D ? 1u : 0u;
-    rasterInterface.sampledBufferCount =
-        (features.computeWork ? 1u : 0u) +
-        (features.copyWork ? 1u : 0u) +
-        (features.aliasing ? 1u : 0u) +
-        (features.externalResource ? 1u : 0u);
+
+    std::uint32_t rasterSrvRegister = 0;
+    if (features.texture2D)
+    {
+        auto use = builder.AddUse(texture, Effect::Read, ViewRole::SampledTexture);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("MainTexture", ProgramParameterKind::SampledTexture, rasterSrvRegister++, use.Value());
+    }
+    if (features.computeWork)
+    {
+        auto use = builder.AddUse(computeColor, Effect::Read, ViewRole::ShaderBuffer);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("ComputeColorInput", ProgramParameterKind::ReadOnlyBuffer, rasterSrvRegister++, use.Value());
+    }
+    if (features.copyWork)
+    {
+        auto use = builder.AddUse(copiedColor, Effect::Read, ViewRole::ShaderBuffer);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("CopiedColorInput", ProgramParameterKind::ReadOnlyBuffer, rasterSrvRegister++, use.Value());
+    }
+    if (features.aliasing)
+    {
+        auto use = builder.AddUse(aliasedColor, Effect::Read, ViewRole::ShaderBuffer);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("AliasedColorInput", ProgramParameterKind::ReadOnlyBuffer, rasterSrvRegister++, use.Value());
+    }
+    if (features.externalResource)
+    {
+        auto use = builder.AddUse(externalColor, Effect::Read, ViewRole::ShaderBuffer);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        addRasterParameter("ExternalColorInput", ProgramParameterKind::ReadOnlyBuffer, rasterSrvRegister++, use.Value());
+    }
+
+    rasterOperands.push_back({WorkOperandKind::ColorAttachment, colorUse.Value(), {}});
+    if (features.depthAttachment)
+    {
+        auto use = builder.AddUse(depth, Effect::Write, ViewRole::DepthAttachment);
+        if (!use) return Fail<SemanticGraph>(use.Error());
+        rasterOperands.push_back({WorkOperandKind::DepthAttachment, use.Value(), {}});
+    }
+    rasterOperands.push_back({WorkOperandKind::PresentSource, presentUse.Value(), {}});
 
     const auto shaderSource = BuildShaderSource(features);
     auto rasterProgram = builder.AddRasterProgram(
@@ -406,43 +419,48 @@ base::Result<SemanticGraph, std::string> BuildProgressiveGraph(
     // Deliberately declare the final raster Work first. The general analysis must
     // derive Compute/Copy -> Raster from ResourceUse hazards rather than declaration order.
     auto rasterWork = builder.AddRasterWorkGeneric(
-        "Level1RasterWork", rasterProgram.Value(), rasterUses,
+        "Level1RasterWork", rasterProgram.Value(), rasterOperands,
         static_cast<std::uint32_t>(geometry.vertices.size()));
     if (!rasterWork) return Fail<SemanticGraph>(rasterWork.Error());
 
     if (features.computeWork)
     {
-        std::vector<ResourceUseId> computeUses;
+        ProgramInterface computeInterface;
+        std::vector<WorkOperand> computeOperands;
+        const auto addComputeParameter = [&](std::string name, ProgramParameterKind kind,
+                                             std::uint32_t shaderRegister, ResourceUseId use,
+                                             std::uint64_t requiredBytes = 0,
+                                             std::uint32_t requiredAlignment = 1)
+        {
+            const semantic::ProgramParameterId id{static_cast<std::uint32_t>(computeInterface.parameters.size())};
+            computeInterface.parameters.push_back({id, std::move(name), kind, ShaderStage::Compute,
+                shaderRegister, requiredBytes, requiredAlignment});
+            computeOperands.push_back({WorkOperandKind::ProgramParameter, use, id});
+        };
+
         if (features.dynamicData)
         {
             auto use = builder.AddUse(frameConstants, Effect::Read, ViewRole::ConstantData);
             if (!use) return Fail<SemanticGraph>(use.Error());
-            computeUses.push_back(use.Value());
+            addComputeParameter("FrameConstants", ProgramParameterKind::ConstantBuffer, 0, use.Value(),
+                                FrameConstantBytes, FrameConstantAlignment);
         }
         if (features.temporal)
         {
-            auto previous = builder.AddUse(computeColor, Effect::Read, ViewRole::TemporalPreviousBuffer);
+            auto previous = builder.AddUse(computeColor, Effect::Read, ViewRole::ShaderBuffer, TemporalRelation::Previous);
             if (!previous) return Fail<SemanticGraph>(previous.Error());
-            computeUses.push_back(previous.Value());
+            addComputeParameter("PreviousFrameColor", ProgramParameterKind::ReadOnlyBuffer, 0, previous.Value());
         }
         auto output = builder.AddUse(computeColor, Effect::Write, ViewRole::StorageBuffer);
         if (!output) return Fail<SemanticGraph>(output.Error());
-        computeUses.push_back(output.Value());
+        addComputeParameter("ComputeColorOutput", ProgramParameterKind::UnorderedBuffer, 0, output.Value());
 
-        ProgramInterface computeInterface;
-        if (features.dynamicData)
-        {
-            computeInterface.constantDataBytes = FrameConstantBytes;
-            computeInterface.constantDataAlignment = FrameConstantAlignment;
-        }
-        computeInterface.sampledBufferCount = features.temporal ? 1u : 0u;
-        computeInterface.unorderedBufferCount = 1;
         auto computeProgram = builder.AddComputeProgram(
             "Level1ComputeProgram", std::move(computeInterface),
             ProgramSource{shaderSource, {}, {}, "CSMain"});
         if (!computeProgram) return Fail<SemanticGraph>(computeProgram.Error());
         auto computeWork = builder.AddComputeWorkGeneric(
-            "Level1ComputeWork", computeProgram.Value(), computeUses, 1, 1, 1);
+            "Level1ComputeWork", computeProgram.Value(), computeOperands, 1, 1, 1);
         if (!computeWork) return Fail<SemanticGraph>(computeWork.Error());
     }
 
@@ -451,7 +469,7 @@ base::Result<SemanticGraph, std::string> BuildProgressiveGraph(
         auto sourceUse = builder.AddUse(copySource, Effect::Read, ViewRole::CopySource);
         auto destinationUse = builder.AddUse(copiedColor, Effect::Write, ViewRole::CopyDestination);
         if (!sourceUse || !destinationUse)
-            return Fail<SemanticGraph>("failed to create Level-1 Copy resource uses");
+            return Fail<SemanticGraph>("failed to create Level-1 Copy ResourceUses");
         auto copyWork = builder.AddCopyWork(
             "Level1CopyWork", sourceUse.Value(), destinationUse.Value(), ColorStride);
         if (!copyWork) return Fail<SemanticGraph>(copyWork.Error());

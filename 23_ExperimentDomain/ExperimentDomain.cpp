@@ -155,79 +155,103 @@ base::Result<semantic::SemanticGraph, std::string> BuildCommonSemanticGraph(
     if (!validated)
         return base::Result<semantic::SemanticGraph, std::string>::Failure(validated.Error());
 
-    semantic::SemanticBuilder builder;
+    using namespace semantic;
+    SemanticBuilder builder;
     const auto vertexBytes = std::as_bytes(std::span<const TriangleVertex>(
         geometry.vertices.data(), geometry.vertices.size()));
 
     auto vertexBuffer = builder.AddImmutableBuffer("CommonExperimentVertices", sizeof(TriangleVertex), vertexBytes);
-    if (!vertexBuffer) return base::Result<semantic::SemanticGraph, std::string>::Failure(vertexBuffer.Error());
+    if (!vertexBuffer) return base::Result<SemanticGraph, std::string>::Failure(vertexBuffer.Error());
     auto frameConstants = builder.AddDynamicBuffer("CommonExperimentFrameConstants", FrameConstantBytes, FrameConstantAlignment);
-    if (!frameConstants) return base::Result<semantic::SemanticGraph, std::string>::Failure(frameConstants.Error());
-    auto texture = builder.AddImmutableTexture2D("CommonExperimentTexture", TextureWidth, TextureHeight, semantic::FormatMeaning::Bgra8Unorm, TextureRowBytes, TextureBytes);
-    if (!texture) return base::Result<semantic::SemanticGraph, std::string>::Failure(texture.Error());
-    auto depth = builder.AddDepthAttachmentTexture2D("MainDepthAttachment", semantic::FormatMeaning::Depth32Float);
-    if (!depth) return base::Result<semantic::SemanticGraph, std::string>::Failure(depth.Error());
+    if (!frameConstants) return base::Result<SemanticGraph, std::string>::Failure(frameConstants.Error());
+    auto texture = builder.AddImmutableTexture2D("CommonExperimentTexture", TextureWidth, TextureHeight, FormatMeaning::Bgra8Unorm, TextureRowBytes, TextureBytes);
+    if (!texture) return base::Result<SemanticGraph, std::string>::Failure(texture.Error());
+    auto depth = builder.AddDepthAttachmentTexture2D("MainDepthAttachment", FormatMeaning::Depth32Float);
+    if (!depth) return base::Result<SemanticGraph, std::string>::Failure(depth.Error());
     auto computeColor = builder.AddTemporalGpuWrittenBuffer("TemporalColorHistory", ComputeColorStride, std::as_bytes(std::span(InitialTemporalColor)));
-    if (!computeColor) return base::Result<semantic::SemanticGraph, std::string>::Failure(computeColor.Error());
+    if (!computeColor) return base::Result<SemanticGraph, std::string>::Failure(computeColor.Error());
     auto copyColorSource = builder.AddImmutableBuffer("CopyColorSource", CopyColorStride, std::as_bytes(std::span(CopyColorSource)));
-    if (!copyColorSource) return base::Result<semantic::SemanticGraph, std::string>::Failure(copyColorSource.Error());
+    if (!copyColorSource) return base::Result<SemanticGraph, std::string>::Failure(copyColorSource.Error());
     auto copiedColor = builder.AddGpuWrittenBuffer("CopiedColor", CopyColorBytes, CopyColorStride);
-    if (!copiedColor) return base::Result<semantic::SemanticGraph, std::string>::Failure(copiedColor.Error());
-    auto surface = builder.AddPresentationSurface("MainPresentationSurface", semantic::FormatMeaning::Bgra8Unorm);
-    if (!surface) return base::Result<semantic::SemanticGraph, std::string>::Failure(surface.Error());
+    if (!copiedColor) return base::Result<SemanticGraph, std::string>::Failure(copiedColor.Error());
+    auto surface = builder.AddPresentationSurface("MainPresentationSurface", FormatMeaning::Bgra8Unorm);
+    if (!surface) return base::Result<SemanticGraph, std::string>::Failure(surface.Error());
     auto aliasWarmup = builder.AddPreparationBuffer("AliasWarmup", sizeof(AliasWarmupColor), std::as_bytes(std::span(AliasWarmupColor)));
-    if (!aliasWarmup) return base::Result<semantic::SemanticGraph, std::string>::Failure(aliasWarmup.Error());
+    if (!aliasWarmup) return base::Result<SemanticGraph, std::string>::Failure(aliasWarmup.Error());
     auto aliasedColor = builder.AddImmutableBuffer("AliasedRasterColor", sizeof(AliasedRasterColor), std::as_bytes(std::span(AliasedRasterColor)));
-    if (!aliasedColor) return base::Result<semantic::SemanticGraph, std::string>::Failure(aliasedColor.Error());
+    if (!aliasedColor) return base::Result<SemanticGraph, std::string>::Failure(aliasedColor.Error());
+    auto aliasContract = builder.SetAliasPreparation(aliasedColor.Value(), aliasWarmup.Value());
+    if (!aliasContract) return base::Result<SemanticGraph, std::string>::Failure(aliasContract.Error());
     auto externalColor = builder.AddExternalBuffer("ExternalFrameColor", 16, 16);
-    if (!externalColor) return base::Result<semantic::SemanticGraph, std::string>::Failure(externalColor.Error());
+    if (!externalColor) return base::Result<SemanticGraph, std::string>::Failure(externalColor.Error());
 
-    auto vertexUse = builder.AddUse(vertexBuffer.Value(), semantic::Effect::Read, semantic::ViewRole::VertexData);
-    auto rasterConstantUse = builder.AddUse(frameConstants.Value(), semantic::Effect::Read, semantic::ViewRole::ConstantData);
-    auto textureUse = builder.AddUse(texture.Value(), semantic::Effect::Read, semantic::ViewRole::SampledTexture);
-    auto computedReadUse = builder.AddUse(computeColor.Value(), semantic::Effect::Read, semantic::ViewRole::ComputedBuffer);
-    auto copiedReadUse = builder.AddUse(copiedColor.Value(), semantic::Effect::Read, semantic::ViewRole::CopiedBuffer);
-    auto aliasedReadUse = builder.AddUse(aliasedColor.Value(), semantic::Effect::Read, semantic::ViewRole::AliasedBuffer);
-    auto externalReadUse = builder.AddUse(externalColor.Value(), semantic::Effect::Read, semantic::ViewRole::ExternalBuffer);
-    auto colorUse = builder.AddUse(surface.Value(), semantic::Effect::Write, semantic::ViewRole::ColorAttachment);
-    auto depthUse = builder.AddUse(depth.Value(), semantic::Effect::Write, semantic::ViewRole::DepthAttachment);
-    auto presentUse = builder.AddUse(surface.Value(), semantic::Effect::Read, semantic::ViewRole::PresentSource);
-    auto computeConstantUse = builder.AddUse(frameConstants.Value(), semantic::Effect::Read, semantic::ViewRole::ConstantData);
-    auto temporalPreviousUse = builder.AddUse(computeColor.Value(), semantic::Effect::Read, semantic::ViewRole::TemporalPreviousBuffer);
-    auto computeOutputUse = builder.AddUse(computeColor.Value(), semantic::Effect::Write, semantic::ViewRole::StorageBuffer);
-    auto copySourceUse = builder.AddUse(copyColorSource.Value(), semantic::Effect::Read, semantic::ViewRole::CopySource);
-    auto copyDestinationUse = builder.AddUse(copiedColor.Value(), semantic::Effect::Write, semantic::ViewRole::CopyDestination);
-    if (!vertexUse || !rasterConstantUse || !textureUse || !computedReadUse || !copiedReadUse || !aliasedReadUse || !externalReadUse || !colorUse || !depthUse || !presentUse || !computeConstantUse || !temporalPreviousUse || !computeOutputUse || !copySourceUse || !copyDestinationUse)
-        return base::Result<semantic::SemanticGraph, std::string>::Failure("failed to create common experiment resource uses");
+    auto vertexUse = builder.AddUse(vertexBuffer.Value(), Effect::Read, ViewRole::VertexData);
+    auto rasterConstantUse = builder.AddUse(frameConstants.Value(), Effect::Read, ViewRole::ConstantData);
+    auto textureUse = builder.AddUse(texture.Value(), Effect::Read, ViewRole::SampledTexture);
+    auto computedReadUse = builder.AddUse(computeColor.Value(), Effect::Read, ViewRole::ShaderBuffer);
+    auto copiedReadUse = builder.AddUse(copiedColor.Value(), Effect::Read, ViewRole::ShaderBuffer);
+    auto aliasedReadUse = builder.AddUse(aliasedColor.Value(), Effect::Read, ViewRole::ShaderBuffer);
+    auto externalReadUse = builder.AddUse(externalColor.Value(), Effect::Read, ViewRole::ShaderBuffer);
+    auto colorUse = builder.AddUse(surface.Value(), Effect::Write, ViewRole::ColorAttachment);
+    auto depthUse = builder.AddUse(depth.Value(), Effect::Write, ViewRole::DepthAttachment);
+    auto presentUse = builder.AddUse(surface.Value(), Effect::Read, ViewRole::PresentSource);
+    auto computeConstantUse = builder.AddUse(frameConstants.Value(), Effect::Read, ViewRole::ConstantData);
+    auto temporalPreviousUse = builder.AddUse(computeColor.Value(), Effect::Read, ViewRole::ShaderBuffer, TemporalRelation::Previous);
+    auto computeOutputUse = builder.AddUse(computeColor.Value(), Effect::Write, ViewRole::StorageBuffer);
+    auto copySourceUse = builder.AddUse(copyColorSource.Value(), Effect::Read, ViewRole::CopySource);
+    auto copyDestinationUse = builder.AddUse(copiedColor.Value(), Effect::Write, ViewRole::CopyDestination);
+    if (!vertexUse || !rasterConstantUse || !textureUse || !computedReadUse || !copiedReadUse ||
+        !aliasedReadUse || !externalReadUse || !colorUse || !depthUse || !presentUse ||
+        !computeConstantUse || !temporalPreviousUse || !computeOutputUse || !copySourceUse || !copyDestinationUse)
+        return base::Result<SemanticGraph, std::string>::Failure("failed to create common experiment ResourceUses");
 
-    semantic::ProgramInterface rasterInterface;
+    ProgramInterface rasterInterface;
     rasterInterface.vertexStrideBytes = sizeof(TriangleVertex);
-    rasterInterface.vertexInputs.push_back({semantic::VertexInput::Meaning::Position, 3, 0});
-    rasterInterface.vertexInputs.push_back({semantic::VertexInput::Meaning::Color, 4, 12});
-    rasterInterface.vertexInputs.push_back({semantic::VertexInput::Meaning::TexCoord, 2, 28});
-    rasterInterface.constantDataBytes = FrameConstantBytes;
-    rasterInterface.constantDataAlignment = FrameConstantAlignment;
-    rasterInterface.sampledTextureCount = 1;
-    rasterInterface.sampledBufferCount = 4;
+    rasterInterface.vertexInputs.push_back({VertexInput::Meaning::Position, 3, 0});
+    rasterInterface.vertexInputs.push_back({VertexInput::Meaning::Color, 4, 12});
+    rasterInterface.vertexInputs.push_back({VertexInput::Meaning::TexCoord, 2, 28});
+    rasterInterface.parameters = {
+        {{0}, "FrameConstants", ProgramParameterKind::ConstantBuffer, ShaderStage::Vertex, 0, FrameConstantBytes, FrameConstantAlignment},
+        {{1}, "MainTexture", ProgramParameterKind::SampledTexture, ShaderStage::Pixel, 0, 0, 1},
+        {{2}, "ComputeColorInput", ProgramParameterKind::ReadOnlyBuffer, ShaderStage::Pixel, 1, 0, 1},
+        {{3}, "CopiedColorInput", ProgramParameterKind::ReadOnlyBuffer, ShaderStage::Pixel, 2, 0, 1},
+        {{4}, "AliasedColorInput", ProgramParameterKind::ReadOnlyBuffer, ShaderStage::Pixel, 3, 0, 1},
+        {{5}, "ExternalColorInput", ProgramParameterKind::ReadOnlyBuffer, ShaderStage::Pixel, 4, 0, 1}};
     auto rasterProgram = builder.AddRasterProgram("CommonExperimentRasterProgram", std::move(rasterInterface), {ShaderSource, "VSMain", "PSMain", {}});
-    if (!rasterProgram) return base::Result<semantic::SemanticGraph, std::string>::Failure(rasterProgram.Error());
+    if (!rasterProgram) return base::Result<SemanticGraph, std::string>::Failure(rasterProgram.Error());
 
-    semantic::ProgramInterface computeInterface;
-    computeInterface.constantDataBytes = FrameConstantBytes;
-    computeInterface.constantDataAlignment = FrameConstantAlignment;
-    computeInterface.sampledBufferCount = 1;
-    computeInterface.unorderedBufferCount = 1;
+    ProgramInterface computeInterface;
+    computeInterface.parameters = {
+        {{0}, "FrameConstants", ProgramParameterKind::ConstantBuffer, ShaderStage::Compute, 0, FrameConstantBytes, FrameConstantAlignment},
+        {{1}, "PreviousFrameColor", ProgramParameterKind::ReadOnlyBuffer, ShaderStage::Compute, 0, 0, 1},
+        {{2}, "ComputeColorOutput", ProgramParameterKind::UnorderedBuffer, ShaderStage::Compute, 0, 0, 1}};
     auto computeProgram = builder.AddComputeProgram("CommonExperimentComputeProgram", std::move(computeInterface), {ShaderSource, {}, {}, "CSMain"});
-    if (!computeProgram) return base::Result<semantic::SemanticGraph, std::string>::Failure(computeProgram.Error());
+    if (!computeProgram) return base::Result<SemanticGraph, std::string>::Failure(computeProgram.Error());
+
+    const std::array<WorkOperand, 10> rasterOperands = {
+        WorkOperand{WorkOperandKind::VertexData, vertexUse.Value(), {}},
+        WorkOperand{WorkOperandKind::ProgramParameter, rasterConstantUse.Value(), {0}},
+        WorkOperand{WorkOperandKind::ProgramParameter, textureUse.Value(), {1}},
+        WorkOperand{WorkOperandKind::ProgramParameter, computedReadUse.Value(), {2}},
+        WorkOperand{WorkOperandKind::ProgramParameter, copiedReadUse.Value(), {3}},
+        WorkOperand{WorkOperandKind::ProgramParameter, aliasedReadUse.Value(), {4}},
+        WorkOperand{WorkOperandKind::ProgramParameter, externalReadUse.Value(), {5}},
+        WorkOperand{WorkOperandKind::ColorAttachment, colorUse.Value(), {}},
+        WorkOperand{WorkOperandKind::DepthAttachment, depthUse.Value(), {}},
+        WorkOperand{WorkOperandKind::PresentSource, presentUse.Value(), {}}};
+    const std::array<WorkOperand, 3> computeOperands = {
+        WorkOperand{WorkOperandKind::ProgramParameter, computeConstantUse.Value(), {0}},
+        WorkOperand{WorkOperandKind::ProgramParameter, temporalPreviousUse.Value(), {1}},
+        WorkOperand{WorkOperandKind::ProgramParameter, computeOutputUse.Value(), {2}}};
 
     // Declaration order is intentionally not execution order. SemanticAnalysis derives Copy -> Compute -> Raster.
-    auto rasterWork = builder.AddRasterWork("DrawCommonExperiment", rasterProgram.Value(), vertexUse.Value(), rasterConstantUse.Value(), textureUse.Value(), computedReadUse.Value(), copiedReadUse.Value(), aliasedReadUse.Value(), externalReadUse.Value(), colorUse.Value(), depthUse.Value(), presentUse.Value(), static_cast<std::uint32_t>(geometry.vertices.size()));
-    if (!rasterWork) return base::Result<semantic::SemanticGraph, std::string>::Failure(rasterWork.Error());
-    auto computeWork = builder.AddComputeWork("AccumulateTemporalColor", computeProgram.Value(), computeConstantUse.Value(), temporalPreviousUse.Value(), computeOutputUse.Value(), 1, 1, 1);
-    if (!computeWork) return base::Result<semantic::SemanticGraph, std::string>::Failure(computeWork.Error());
+    auto rasterWork = builder.AddRasterWorkGeneric("DrawCommonExperiment", rasterProgram.Value(), rasterOperands, static_cast<std::uint32_t>(geometry.vertices.size()));
+    if (!rasterWork) return base::Result<SemanticGraph, std::string>::Failure(rasterWork.Error());
+    auto computeWork = builder.AddComputeWorkGeneric("AccumulateTemporalColor", computeProgram.Value(), computeOperands, 1, 1, 1);
+    if (!computeWork) return base::Result<SemanticGraph, std::string>::Failure(computeWork.Error());
     auto copyWork = builder.AddCopyWork("CopyStaticColor", copySourceUse.Value(), copyDestinationUse.Value(), CopyColorBytes);
-    if (!copyWork) return base::Result<semantic::SemanticGraph, std::string>::Failure(copyWork.Error());
+    if (!copyWork) return base::Result<SemanticGraph, std::string>::Failure(copyWork.Error());
 
-    return base::Result<semantic::SemanticGraph, std::string>::Success(std::move(builder).Build());
+    return base::Result<SemanticGraph, std::string>::Success(std::move(builder).Build());
 }
 }

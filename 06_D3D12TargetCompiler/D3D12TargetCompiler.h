@@ -37,6 +37,10 @@ struct CompileOutput final
     std::string executionDigestHex;
 };
 
+[[nodiscard]] base::Result<void, CompileError> ValidateLevel2Capability(
+    const semantic::SemanticGraph& graph,
+    const target::D3D12TargetProfile& targetProfile);
+
 [[nodiscard]] base::Result<CompileOutput, CompileError> Compile(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile);

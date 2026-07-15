@@ -263,13 +263,49 @@ base::Result<ResourceId, std::string> SemanticBuilder::AddPresentationSurface(
     return base::Result<ResourceId, std::string>::Success(id);
 }
 
-base::Result<ResourceUseId, std::string> SemanticBuilder::AddUse(ResourceId resource, Effect effect, ViewRole role)
+base::Result<void, std::string> SemanticBuilder::SetAliasPreparation(
+    ResourceId target,
+    ResourceId preparation)
+{
+    if (!target.IsValid() || target.value >= graph_.resources.size() ||
+        !preparation.IsValid() || preparation.value >= graph_.resources.size())
+        return base::Result<void, std::string>::Failure("alias contract references an unknown resource");
+    if (target == preparation)
+        return base::Result<void, std::string>::Failure("alias target and preparation resource must differ");
+    if (graph_.resources[preparation.value].lifetime != LifetimeIntent::Preparation)
+        return base::Result<void, std::string>::Failure("alias preparation resource must have Preparation lifetime");
+    if (graph_.resources[target.value].lifetime == LifetimeIntent::Preparation ||
+        graph_.resources[target.value].lifetime == LifetimeIntent::External)
+        return base::Result<void, std::string>::Failure("alias target must be a package-owned frame resource");
+    if (graph_.resources[target.value].aliasPreparation.IsValid())
+        return base::Result<void, std::string>::Failure("alias target already has a preparation resource");
+    graph_.resources[target.value].aliasPreparation = preparation;
+    return base::Result<void, std::string>::Success();
+}
+
+base::Result<ResourceUseId, std::string> SemanticBuilder::AddUse(
+    ResourceId resource,
+    Effect effect,
+    ViewRole role,
+    TemporalRelation temporalRelation)
 {
     if (!resource.IsValid() || resource.value >= graph_.resources.size())
         return base::Result<ResourceUseId, std::string>::Failure("resource use references an unknown resource");
     const auto id = NextId<ResourceUseId>(graph_.resourceUses.size());
-    graph_.resourceUses.push_back(ResourceUse{id, resource, effect, role});
+    graph_.resourceUses.push_back(ResourceUse{id, resource, effect, role, temporalRelation});
     return base::Result<ResourceUseId, std::string>::Success(id);
+}
+
+namespace
+{
+bool ValidateParameterIds(const ProgramInterface& interfaceDescription)
+{
+    for (std::size_t index = 0; index < interfaceDescription.parameters.size(); ++index)
+        if (!interfaceDescription.parameters[index].id.IsValid() ||
+            interfaceDescription.parameters[index].id.value != index)
+            return false;
+    return true;
+}
 }
 
 base::Result<ProgramId, std::string> SemanticBuilder::AddRasterProgram(
@@ -279,8 +315,8 @@ base::Result<ProgramId, std::string> SemanticBuilder::AddRasterProgram(
 {
     if (interfaceDescription.vertexInputs.empty() || interfaceDescription.vertexStrideBytes == 0)
         return base::Result<ProgramId, std::string>::Failure("raster program requires an explicit vertex interface");
-    if (interfaceDescription.constantDataBytes != 0 && !base::IsPowerOfTwo(interfaceDescription.constantDataAlignment))
-        return base::Result<ProgramId, std::string>::Failure("raster program constant-data alignment must be a power of two");
+    if (!ValidateParameterIds(interfaceDescription))
+        return base::Result<ProgramId, std::string>::Failure("raster program parameter IDs must be dense and ordered");
     if (source.hlslSource.empty() || source.vertexEntry.empty() || source.pixelEntry.empty())
         return base::Result<ProgramId, std::string>::Failure("raster program source and entry points must be explicit compiler inputs");
     const auto id = NextId<ProgramId>(graph_.programs.size());
@@ -295,8 +331,8 @@ base::Result<ProgramId, std::string> SemanticBuilder::AddComputeProgram(
 {
     if (!interfaceDescription.vertexInputs.empty() || interfaceDescription.vertexStrideBytes != 0)
         return base::Result<ProgramId, std::string>::Failure("compute program cannot declare a raster vertex interface");
-    if (interfaceDescription.constantDataBytes != 0 && !base::IsPowerOfTwo(interfaceDescription.constantDataAlignment))
-        return base::Result<ProgramId, std::string>::Failure("compute program constant-data alignment must be a power of two");
+    if (!ValidateParameterIds(interfaceDescription))
+        return base::Result<ProgramId, std::string>::Failure("compute program parameter IDs must be dense and ordered");
     if (source.hlslSource.empty() || source.computeEntry.empty())
         return base::Result<ProgramId, std::string>::Failure("compute program source and entry point must be explicit compiler inputs");
     const auto id = NextId<ProgramId>(graph_.programs.size());
@@ -304,35 +340,48 @@ base::Result<ProgramId, std::string> SemanticBuilder::AddComputeProgram(
     return base::Result<ProgramId, std::string>::Success(id);
 }
 
-base::Result<WorkId, std::string> SemanticBuilder::AddRasterWork(
+base::Result<void, std::string> SemanticBuilder::ValidateOperands(
+    ProgramId program,
+    std::span<const WorkOperand> operands,
+    ProgramKind expectedKind) const
+{
+    if (!program.IsValid() || program.value >= graph_.programs.size() ||
+        graph_.programs[program.value].kind != expectedKind)
+        return base::Result<void, std::string>::Failure("work references an unknown program of the required kind");
+    if (operands.empty())
+        return base::Result<void, std::string>::Failure("work requires at least one operand");
+    for (const auto& operand : operands)
+    {
+        if (!operand.use.IsValid() || operand.use.value >= graph_.resourceUses.size())
+            return base::Result<void, std::string>::Failure("work operand references an unknown ResourceUse");
+        if (operand.kind == WorkOperandKind::ProgramParameter &&
+            (!operand.parameter.IsValid() || operand.parameter.value >= graph_.programs[program.value].interface.parameters.size()))
+            return base::Result<void, std::string>::Failure("work operand references an unknown ProgramParameter");
+        if (operand.kind != WorkOperandKind::ProgramParameter && operand.parameter.IsValid())
+            return base::Result<void, std::string>::Failure("non-parameter work operand cannot carry a ProgramParameter ID");
+    }
+    return base::Result<void, std::string>::Success();
+}
+
+base::Result<WorkId, std::string> SemanticBuilder::AddRasterWorkGeneric(
     std::string debugName,
     ProgramId program,
-    ResourceUseId vertexData,
-    ResourceUseId constantData,
-    ResourceUseId sampledTexture,
-    ResourceUseId computedData,
-    ResourceUseId copiedData,
-    ResourceUseId aliasedData,
-    ResourceUseId externalData,
-    ResourceUseId colorAttachment,
-    ResourceUseId depthAttachment,
-    ResourceUseId presentSource,
+    std::span<const WorkOperand> operands,
     std::uint32_t vertexCount)
 {
-    if (!program.IsValid() || program.value >= graph_.programs.size())
-        return base::Result<WorkId, std::string>::Failure("raster work references an unknown program");
-    const auto validUse = [this](ResourceUseId id) { return id.IsValid() && id.value < graph_.resourceUses.size(); };
-    if (!validUse(vertexData) || !validUse(constantData) || !validUse(sampledTexture) || !validUse(computedData) || !validUse(copiedData) || !validUse(aliasedData) || !validUse(externalData) || !validUse(colorAttachment) || !validUse(depthAttachment) || !validUse(presentSource))
-        return base::Result<WorkId, std::string>::Failure("raster work references an unknown resource use");
-    if (vertexCount == 0) return base::Result<WorkId, std::string>::Failure("raster work requires a positive vertex count");
+    auto valid = ValidateOperands(program, operands, ProgramKind::Raster);
+    if (!valid) return base::Result<WorkId, std::string>::Failure(valid.Error());
+    if (vertexCount == 0)
+        return base::Result<WorkId, std::string>::Failure("raster work requires a positive vertex count");
 
     const auto id = NextId<WorkId>(graph_.works.size());
     Work work;
     work.id = id;
     work.debugName = std::move(debugName);
     work.kind = WorkKind::Raster;
-    work.uses = {vertexData, constantData, sampledTexture, computedData, copiedData, aliasedData, externalData, colorAttachment, depthAttachment, presentSource};
-    work.raster = RasterPayload{program, vertexData, constantData, sampledTexture, computedData, copiedData, aliasedData, externalData, colorAttachment, depthAttachment, presentSource, vertexCount};
+    work.operands.assign(operands.begin(), operands.end());
+    work.raster.program = program;
+    work.raster.vertexCount = vertexCount;
     graph_.works.push_back(std::move(work));
     return base::Result<WorkId, std::string>::Success(id);
 }
@@ -345,7 +394,7 @@ base::Result<WorkId, std::string> SemanticBuilder::AddCopyWork(
 {
     const auto validUse = [this](ResourceUseId id) { return id.IsValid() && id.value < graph_.resourceUses.size(); };
     if (!validUse(source) || !validUse(destination))
-        return base::Result<WorkId, std::string>::Failure("copy work references an unknown resource use");
+        return base::Result<WorkId, std::string>::Failure("copy work references an unknown ResourceUse");
     if (bytes == 0)
         return base::Result<WorkId, std::string>::Failure("copy work byte count must be positive");
 
@@ -354,54 +403,24 @@ base::Result<WorkId, std::string> SemanticBuilder::AddCopyWork(
     work.id = id;
     work.debugName = std::move(debugName);
     work.kind = WorkKind::Copy;
-    work.uses = {source, destination};
-    work.copy = CopyPayload{source, destination, bytes};
+    work.operands = {
+        WorkOperand{WorkOperandKind::CopySource, source, {}},
+        WorkOperand{WorkOperandKind::CopyDestination, destination, {}}};
+    work.copy.bytes = bytes;
     graph_.works.push_back(std::move(work));
     return base::Result<WorkId, std::string>::Success(id);
 }
 
-base::Result<WorkId, std::string> SemanticBuilder::AddRasterWorkGeneric(
+base::Result<WorkId, std::string> SemanticBuilder::AddComputeWorkGeneric(
     std::string debugName,
     ProgramId program,
-    std::span<const ResourceUseId> uses,
-    std::uint32_t vertexCount)
-{
-    if (!program.IsValid() || program.value >= graph_.programs.size() ||
-        graph_.programs[program.value].kind != ProgramKind::Raster)
-        return base::Result<WorkId, std::string>::Failure("raster work references an unknown raster program");
-    if (uses.empty() || vertexCount == 0)
-        return base::Result<WorkId, std::string>::Failure("raster work requires uses and a positive vertex count");
-    for (const auto use : uses)
-        if (!use.IsValid() || use.value >= graph_.resourceUses.size())
-            return base::Result<WorkId, std::string>::Failure("raster work references an unknown resource use");
-
-    const auto id = NextId<WorkId>(graph_.works.size());
-    Work work;
-    work.id = id;
-    work.debugName = std::move(debugName);
-    work.kind = WorkKind::Raster;
-    work.uses.assign(uses.begin(), uses.end());
-    work.raster.program = program;
-    work.raster.vertexCount = vertexCount;
-    graph_.works.push_back(std::move(work));
-    return base::Result<WorkId, std::string>::Success(id);
-}
-
-base::Result<WorkId, std::string> SemanticBuilder::AddComputeWork(
-    std::string debugName,
-    ProgramId program,
-    ResourceUseId constantData,
-    ResourceUseId previous,
-    ResourceUseId output,
+    std::span<const WorkOperand> operands,
     std::uint32_t threadGroupCountX,
     std::uint32_t threadGroupCountY,
     std::uint32_t threadGroupCountZ)
 {
-    if (!program.IsValid() || program.value >= graph_.programs.size() || graph_.programs[program.value].kind != ProgramKind::Compute)
-        return base::Result<WorkId, std::string>::Failure("compute work references an unknown compute program");
-    const auto validUse = [this](ResourceUseId id) { return id.IsValid() && id.value < graph_.resourceUses.size(); };
-    if (!validUse(constantData) || !validUse(previous) || !validUse(output))
-        return base::Result<WorkId, std::string>::Failure("compute work references an unknown resource use");
+    auto valid = ValidateOperands(program, operands, ProgramKind::Compute);
+    if (!valid) return base::Result<WorkId, std::string>::Failure(valid.Error());
     if (threadGroupCountX == 0 || threadGroupCountY == 0 || threadGroupCountZ == 0)
         return base::Result<WorkId, std::string>::Failure("compute work dispatch dimensions must be positive");
 
@@ -410,35 +429,7 @@ base::Result<WorkId, std::string> SemanticBuilder::AddComputeWork(
     work.id = id;
     work.debugName = std::move(debugName);
     work.kind = WorkKind::Compute;
-    work.uses = {constantData, previous, output};
-    work.compute = ComputePayload{program, constantData, previous, output, threadGroupCountX, threadGroupCountY, threadGroupCountZ};
-    graph_.works.push_back(std::move(work));
-    return base::Result<WorkId, std::string>::Success(id);
-}
-
-base::Result<WorkId, std::string> SemanticBuilder::AddComputeWorkGeneric(
-    std::string debugName,
-    ProgramId program,
-    std::span<const ResourceUseId> uses,
-    std::uint32_t threadGroupCountX,
-    std::uint32_t threadGroupCountY,
-    std::uint32_t threadGroupCountZ)
-{
-    if (!program.IsValid() || program.value >= graph_.programs.size() ||
-        graph_.programs[program.value].kind != ProgramKind::Compute)
-        return base::Result<WorkId, std::string>::Failure("compute work references an unknown compute program");
-    if (uses.empty() || threadGroupCountX == 0 || threadGroupCountY == 0 || threadGroupCountZ == 0)
-        return base::Result<WorkId, std::string>::Failure("compute work requires uses and positive dispatch dimensions");
-    for (const auto use : uses)
-        if (!use.IsValid() || use.value >= graph_.resourceUses.size())
-            return base::Result<WorkId, std::string>::Failure("compute work references an unknown resource use");
-
-    const auto id = NextId<WorkId>(graph_.works.size());
-    Work work;
-    work.id = id;
-    work.debugName = std::move(debugName);
-    work.kind = WorkKind::Compute;
-    work.uses.assign(uses.begin(), uses.end());
+    work.operands.assign(operands.begin(), operands.end());
     work.compute.program = program;
     work.compute.threadGroupCountX = threadGroupCountX;
     work.compute.threadGroupCountY = threadGroupCountY;
@@ -452,13 +443,13 @@ base::Result<WorkId, std::string> SemanticBuilder::AddPresentWork(
     ResourceUseId presentSource)
 {
     if (!presentSource.IsValid() || presentSource.value >= graph_.resourceUses.size())
-        return base::Result<WorkId, std::string>::Failure("present work references an unknown resource use");
+        return base::Result<WorkId, std::string>::Failure("present work references an unknown ResourceUse");
     const auto id = NextId<WorkId>(graph_.works.size());
     Work work;
     work.id = id;
     work.debugName = std::move(debugName);
     work.kind = WorkKind::Present;
-    work.uses = {presentSource};
+    work.operands = {WorkOperand{WorkOperandKind::PresentSource, presentSource, {}}};
     graph_.works.push_back(std::move(work));
     return base::Result<WorkId, std::string>::Success(id);
 }
@@ -469,12 +460,16 @@ base::Result<void, std::string> SemanticBuilder::AddDependency(
 {
     if (!predecessor.IsValid() || !successor.IsValid() || predecessor == successor ||
         predecessor.value >= graph_.works.size() || successor.value >= graph_.works.size())
-        return base::Result<void, std::string>::Failure("dependency references an unknown or identical Work");
+        return base::Result<void, std::string>::Failure("dependency references an unknown Work or self");
     auto& dependencies = graph_.works[successor.value].dependencies;
-    if (std::find(dependencies.begin(), dependencies.end(), predecessor) == dependencies.end())
-        dependencies.push_back(predecessor);
+    if (std::find(dependencies.begin(), dependencies.end(), predecessor) != dependencies.end())
+        return base::Result<void, std::string>::Failure("dependency is duplicated");
+    dependencies.push_back(predecessor);
     return base::Result<void, std::string>::Success();
 }
 
-SemanticGraph SemanticBuilder::Build() && { return std::move(graph_); }
+SemanticGraph SemanticBuilder::Build() &&
+{
+    return std::move(graph_);
+}
 }

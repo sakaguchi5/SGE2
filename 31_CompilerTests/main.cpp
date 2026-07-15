@@ -32,7 +32,13 @@ sem::SemanticGraph RemapToSparseIds(sem::SemanticGraph graph)
     for (const auto& value : graph.programs) programs[value.id.value] = {value.id.value * 10u + 11u};
     for (const auto& value : graph.works) works[value.id.value] = {value.id.value * 10u + 13u};
 
-    for (auto& resource : graph.resources) resource.id = resources.at(resource.id.value);
+    for (auto& resource : graph.resources)
+    {
+        const auto oldId = resource.id;
+        resource.id = resources.at(oldId.value);
+        if (resource.aliasPreparation.IsValid())
+            resource.aliasPreparation = resources.at(resource.aliasPreparation.value);
+    }
     for (auto& use : graph.resourceUses)
     {
         use.id = uses.at(use.id.value);
@@ -45,25 +51,10 @@ sem::SemanticGraph RemapToSparseIds(sem::SemanticGraph graph)
     {
         const auto oldWork = work.id;
         work.id = works.at(oldWork.value);
-        for (auto& use : work.uses) use = mapUse(use);
+        for (auto& operand : work.operands) operand.use = mapUse(operand.use);
         for (auto& dependency : work.dependencies) dependency = works.at(dependency.value);
         work.raster.program = mapProgram(work.raster.program);
-        work.raster.vertexData = mapUse(work.raster.vertexData);
-        work.raster.constantData = mapUse(work.raster.constantData);
-        work.raster.sampledTexture = mapUse(work.raster.sampledTexture);
-        work.raster.computedData = mapUse(work.raster.computedData);
-        work.raster.copiedData = mapUse(work.raster.copiedData);
-        work.raster.aliasedData = mapUse(work.raster.aliasedData);
-        work.raster.externalData = mapUse(work.raster.externalData);
-        work.raster.colorAttachment = mapUse(work.raster.colorAttachment);
-        work.raster.depthAttachment = mapUse(work.raster.depthAttachment);
-        work.raster.presentSource = mapUse(work.raster.presentSource);
-        work.copy.source = mapUse(work.copy.source);
-        work.copy.destination = mapUse(work.copy.destination);
         work.compute.program = mapProgram(work.compute.program);
-        work.compute.constantData = mapUse(work.compute.constantData);
-        work.compute.previous = mapUse(work.compute.previous);
-        work.compute.output = mapUse(work.compute.output);
     }
     std::reverse(graph.resources.begin(), graph.resources.end());
     std::reverse(graph.resourceUses.begin(), graph.resourceUses.end());
@@ -72,25 +63,34 @@ sem::SemanticGraph RemapToSparseIds(sem::SemanticGraph graph)
     return graph;
 }
 
+const sem::WorkOperand& FindOperand(const sem::Work& work, sem::WorkOperandKind kind)
+{
+    return *std::find_if(work.operands.begin(), work.operands.end(), [kind](const auto& operand) {
+        return operand.kind == kind;
+    });
+}
+
 sem::SemanticGraph AddIndependentCopy(sem::SemanticGraph graph)
 {
     const auto& oldCopy = *std::find_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
         return work.kind == sem::WorkKind::Copy;
     });
-    const auto& oldSourceUse = graph.resourceUses[oldCopy.copy.source.value];
-    const auto& oldDestinationUse = graph.resourceUses[oldCopy.copy.destination.value];
+    const auto& oldSourceUse = graph.resourceUses[FindOperand(oldCopy, sem::WorkOperandKind::CopySource).use.value];
+    const auto& oldDestinationUse = graph.resourceUses[FindOperand(oldCopy, sem::WorkOperandKind::CopyDestination).use.value];
 
     auto source = graph.resources[oldSourceUse.resource.value];
     source.id = {100};
+    source.aliasPreparation = {};
     source.debugName = "GenericExtraCopySource";
     auto destination = graph.resources[oldDestinationUse.resource.value];
     destination.id = {200};
+    destination.aliasPreparation = {};
     destination.debugName = "GenericExtraCopyDestination";
     graph.resources.push_back(source);
     graph.resources.push_back(destination);
 
-    sem::ResourceUse sourceUse{{100}, source.id, sem::Effect::Read, sem::ViewRole::CopySource};
-    sem::ResourceUse destinationUse{{101}, destination.id, sem::Effect::Write, sem::ViewRole::CopyDestination};
+    sem::ResourceUse sourceUse{{100}, source.id, sem::Effect::Read, sem::ViewRole::CopySource, sem::TemporalRelation::Current};
+    sem::ResourceUse destinationUse{{101}, destination.id, sem::Effect::Write, sem::ViewRole::CopyDestination, sem::TemporalRelation::Current};
     graph.resourceUses.push_back(sourceUse);
     graph.resourceUses.push_back(destinationUse);
 
@@ -98,8 +98,10 @@ sem::SemanticGraph AddIndependentCopy(sem::SemanticGraph graph)
     work.id = {100};
     work.debugName = "GenericExtraCopy";
     work.kind = sem::WorkKind::Copy;
-    work.uses = {sourceUse.id, destinationUse.id};
-    work.copy = {sourceUse.id, destinationUse.id, oldCopy.copy.bytes};
+    work.operands = {
+        {sem::WorkOperandKind::CopySource, sourceUse.id, {}},
+        {sem::WorkOperandKind::CopyDestination, destinationUse.id, {}}};
+    work.copy.bytes = oldCopy.copy.bytes;
     graph.works.push_back(work);
     return graph;
 }
@@ -110,22 +112,24 @@ sem::SemanticGraph AddRasterBinding(sem::SemanticGraph graph)
         return resource.kind == sem::ResourceKind::Buffer &&
                resource.update == sem::UpdateIntent::Immutable &&
                resource.lifetime == sem::LifetimeIntent::Persistent &&
-               resource.buffer.sizeBytes == 16;
+               resource.buffer.sizeBytes == 16 && !resource.aliasPreparation.IsValid();
     });
     auto resource = *source;
     resource.id = {300};
     resource.debugName = "GenericAdditionalRasterBinding";
     graph.resources.push_back(resource);
-    sem::ResourceUse use{{300}, resource.id, sem::Effect::Read, sem::ViewRole::CopiedBuffer};
+    sem::ResourceUse use{{300}, resource.id, sem::Effect::Read, sem::ViewRole::ShaderBuffer, sem::TemporalRelation::Current};
     graph.resourceUses.push_back(use);
     auto raster = std::find_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
         return work.kind == sem::WorkKind::Raster;
     });
-    raster->uses.push_back(use.id);
     auto program = std::find_if(graph.programs.begin(), graph.programs.end(), [&](const auto& value) {
         return value.id == raster->raster.program;
     });
-    ++program->interface.sampledBufferCount;
+    const sem::ProgramParameterId parameterId{static_cast<std::uint32_t>(program->interface.parameters.size())};
+    program->interface.parameters.push_back({parameterId, "GenericAdditionalRasterBinding",
+        sem::ProgramParameterKind::ReadOnlyBuffer, sem::ShaderStage::Pixel, 5, 0, 1});
+    raster->operands.push_back({sem::WorkOperandKind::ProgramParameter, use.id, parameterId});
     return graph;
 }
 
@@ -326,6 +330,38 @@ int main()
         Count(multiViewResult.Value().FrameOperations(), pkg::D3D12OperationCode::WaitQueue) < 2)
         return 31;
 
-    std::cout << "Generic cardinality, dependency, lifetime, state, queue, allocation, binding, and Package lowering tests passed.\n";
+    auto invalidQueues = profile;
+    invalidQueues.directQueueCount = 2;
+    auto queueCapability = sge::compiler::d3d12::ValidateLevel2Capability(graph, invalidQueues);
+    if (queueCapability || queueCapability.Error().stage != "target-feasibility") return 32;
+
+    auto temporalSingleFrame = profile;
+    temporalSingleFrame.framesInFlight = 1;
+    if (sge::compiler::d3d12::ValidateLevel2Capability(graph, temporalSingleFrame)) return 33;
+
+    auto multiSurfaceGraph = graph;
+    auto extraSurface = *std::find_if(multiSurfaceGraph.resources.begin(), multiSurfaceGraph.resources.end(), [](const auto& resource) {
+        return resource.kind == sem::ResourceKind::SurfaceImage;
+    });
+    extraSurface.id = {500};
+    extraSurface.debugName = "ForbiddenSecondSurface";
+    multiSurfaceGraph.resources.push_back(extraSurface);
+    if (sge::compiler::d3d12::ValidateLevel2Capability(multiSurfaceGraph, profile)) return 34;
+
+    auto multiMipGraph = graph;
+    auto texture = std::find_if(multiMipGraph.resources.begin(), multiMipGraph.resources.end(), [](const auto& resource) {
+        return resource.kind == sem::ResourceKind::Texture2D && resource.update == sem::UpdateIntent::Immutable;
+    });
+    texture->texture2D.mipLevels = 2;
+    if (sge::compiler::d3d12::ValidateLevel2Capability(multiMipGraph, profile)) return 35;
+
+    auto standalonePresent = graph;
+    sem::Work presentWork;
+    presentWork.id = {900};
+    presentWork.kind = sem::WorkKind::Present;
+    standalonePresent.works.push_back(presentWork);
+    if (sge::compiler::d3d12::ValidateLevel2Capability(standalonePresent, profile)) return 36;
+
+    std::cout << "Level-2 capability rejection plus generic cardinality, dependency, lifetime, state, queue, allocation, operand binding, and Package lowering tests passed.\n";
     return 0;
 }

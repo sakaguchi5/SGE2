@@ -116,6 +116,7 @@ struct NativeBinding final
 {
     NativeBindingKind kind = NativeBindingKind::Constant;
     std::uint32_t shaderRegister = 0;
+    semantic::ShaderStage stage = semantic::ShaderStage::Vertex;
 };
 
 base::Result<std::vector<std::byte>, CompileError> SerializeBindingLayout(
@@ -134,9 +135,10 @@ base::Result<std::vector<std::byte>, CompileError> SerializeBindingLayout(
     {
         const auto& binding = bindings[index];
         auto& parameter = parameters[index];
-        parameter.ShaderVisibility = raster ?
-            (binding.kind == NativeBindingKind::Constant ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL) :
-            D3D12_SHADER_VISIBILITY_ALL;
+        parameter.ShaderVisibility = binding.stage == semantic::ShaderStage::Vertex ?
+            D3D12_SHADER_VISIBILITY_VERTEX :
+            binding.stage == semantic::ShaderStage::Pixel ?
+            D3D12_SHADER_VISIBILITY_PIXEL : D3D12_SHADER_VISIBILITY_ALL;
         if (binding.kind == NativeBindingKind::Constant)
         {
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -213,11 +215,16 @@ base::Digest256 InterfaceDigest(const semantic::ProgramInterface& value)
         writer.WriteU16(input.componentCount);
         writer.WriteU32(input.byteOffset);
     }
-    writer.WriteU64(value.constantDataBytes);
-    writer.WriteU32(value.constantDataAlignment);
-    writer.WriteU32(value.sampledTextureCount);
-    writer.WriteU32(value.sampledBufferCount);
-    writer.WriteU32(value.unorderedBufferCount);
+    writer.WriteU32(static_cast<std::uint32_t>(value.parameters.size()));
+    for (const auto& parameter : value.parameters)
+    {
+        writer.WriteU32(parameter.id.value);
+        writer.WriteU16(static_cast<std::uint16_t>(parameter.kind));
+        writer.WriteU16(static_cast<std::uint16_t>(parameter.stage));
+        writer.WriteU32(parameter.shaderRegister);
+        writer.WriteU64(parameter.requiredBytes);
+        writer.WriteU32(parameter.requiredAlignment);
+    }
     return base::Sha256(writer.Bytes());
 }
 
@@ -282,6 +289,8 @@ pkg::ViewClass ViewClass(semantic::ViewRole role)
     {
     case ViewRole::VertexData: return pkg::ViewClass::VertexBuffer;
     case ViewRole::ConstantData: return pkg::ViewClass::ConstantBuffer;
+    case ViewRole::SampledTexture:
+    case ViewRole::ShaderBuffer: return pkg::ViewClass::ShaderResource;
     case ViewRole::ColorAttachment: return pkg::ViewClass::RenderTarget;
     case ViewRole::DepthAttachment: return pkg::ViewClass::DepthStencil;
     case ViewRole::StorageBuffer: return pkg::ViewClass::UnorderedAccess;
@@ -316,19 +325,8 @@ pkg::ResourceState RequiredState(semantic::ViewRole role, semantic::WorkKind wor
 
 bool IsShaderResource(semantic::ViewRole role)
 {
-    using semantic::ViewRole;
-    switch (role)
-    {
-    case ViewRole::SampledTexture:
-    case ViewRole::ComputedBuffer:
-    case ViewRole::CopiedBuffer:
-    case ViewRole::TemporalPreviousBuffer:
-    case ViewRole::AliasedBuffer:
-    case ViewRole::ExternalBuffer:
-        return true;
-    default:
-        return false;
-    }
+    return role == semantic::ViewRole::SampledTexture ||
+           role == semantic::ViewRole::ShaderBuffer;
 }
 
 bool DescriptorBacked(pkg::ViewClass viewClass)
@@ -376,6 +374,68 @@ struct StateCell final
 };
 }
 
+base::Result<void, CompileError> ValidateLevel2Capability(
+    const semantic::SemanticGraph& graph,
+    const target::D3D12TargetProfile& targetProfile)
+{
+    if (targetProfile.framesInFlight == 0 || targetProfile.directQueueCount != 1 ||
+        targetProfile.computeQueueCount > 1 || targetProfile.copyQueueCount > 1 ||
+        targetProfile.shaderBinaryFormat != target::ShaderBinaryFormat::Dxbc ||
+        targetProfile.shaderModelMajor != 5 || targetProfile.shaderModelMinor > 1 ||
+        targetProfile.rootSignatureMajor != 1 || targetProfile.rootSignatureMinor > 1 ||
+        targetProfile.barrierModel != target::BarrierModel::Legacy)
+        return Failure<void>("target-feasibility", "target profile is outside the Level 2 D3D12 v1 capability constitution");
+
+    std::uint32_t surfaceCount = 0;
+    bool hasTemporal = false;
+    for (const auto& resource : graph.resources)
+    {
+        if (resource.kind == semantic::ResourceKind::SurfaceImage) ++surfaceCount;
+        if (resource.lifetime == semantic::LifetimeIntent::Temporal) hasTemporal = true;
+        if (resource.kind == semantic::ResourceKind::Texture2D && resource.texture2D.mipLevels != 1)
+            return Failure<void>("target-feasibility", "Level 2 D3D12 v1 supports Texture2D with exactly one mip level");
+        if (resource.kind == semantic::ResourceKind::Texture2D &&
+            resource.texture2D.extentMeaning == semantic::TextureExtentMeaning::Fixed &&
+            resource.texture2D.formatMeaning != semantic::FormatMeaning::Bgra8Unorm)
+            return Failure<void>("target-feasibility", "fixed Texture2D is limited to Bgra8Unorm in Level 2 D3D12 v1");
+        if (resource.kind == semantic::ResourceKind::Texture2D &&
+            resource.texture2D.extentMeaning == semantic::TextureExtentMeaning::PresentationSurface &&
+            resource.texture2D.formatMeaning != semantic::FormatMeaning::Depth32Float)
+            return Failure<void>("target-feasibility", "surface-relative Texture2D is limited to Depth32Float in Level 2 D3D12 v1");
+    }
+    if (surfaceCount > 1)
+        return Failure<void>("target-feasibility", "Level 2 D3D12 v1 supports at most one presentation SurfaceImage");
+    if (surfaceCount != 0 && targetProfile.surfaceImageCount == 0)
+        return Failure<void>("target-feasibility", "a graph with a SurfaceImage requires a non-zero surface image count");
+    if (hasTemporal && targetProfile.framesInFlight < 2)
+        return Failure<void>("target-feasibility", "Temporal resources require at least two frames in flight");
+
+    bool hasRaster = false;
+    for (const auto& work : graph.works)
+    {
+        if (work.kind == semantic::WorkKind::Present)
+            return Failure<void>("target-feasibility", "Level 2 D3D12 v1 uses the Raster PresentSource operand; standalone Present Work is deferred");
+        if (work.kind == semantic::WorkKind::Raster)
+        {
+            hasRaster = true;
+            std::uint32_t color = 0;
+            std::uint32_t depth = 0;
+            std::uint32_t vertex = 0;
+            for (const auto& operand : work.operands)
+            {
+                if (operand.kind == semantic::WorkOperandKind::ColorAttachment) ++color;
+                if (operand.kind == semantic::WorkOperandKind::DepthAttachment) ++depth;
+                if (operand.kind == semantic::WorkOperandKind::VertexData) ++vertex;
+            }
+            if (vertex != 1 || color != 1 || depth > 1)
+                return Failure<void>("target-feasibility", "Level 2 D3D12 v1 raster work requires one vertex buffer, one color surface, and at most one depth attachment");
+        }
+    }
+    if (surfaceCount != 0 && !hasRaster)
+        return Failure<void>("target-feasibility", "a presentation SurfaceImage must be consumed by at least one Raster Work");
+    return base::Result<void, CompileError>::Success();
+}
+
 base::Result<CompileOutput, CompileError> Compile(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile)
@@ -393,12 +453,9 @@ base::Result<CompileOutput, CompileError> Compile(
     }
     const auto& analyzed = analyzedResult.Value();
 
-    if (targetProfile.framesInFlight == 0 || targetProfile.directQueueCount == 0 ||
-        targetProfile.shaderBinaryFormat != target::ShaderBinaryFormat::Dxbc ||
-        targetProfile.shaderModelMajor != 5 || targetProfile.shaderModelMinor > 1 ||
-        targetProfile.rootSignatureMajor != 1 || targetProfile.rootSignatureMinor > 1 ||
-        targetProfile.barrierModel != target::BarrierModel::Legacy || targetProfile.surfaceImageCount == 0)
-        return Failure<CompileOutput>("target-feasibility", "target profile is outside the generalized D3D12 v14 capability");
+    auto capability = ValidateLevel2Capability(graph, targetProfile);
+    if (!capability)
+        return base::Result<CompileOutput, CompileError>::Failure(capability.Error());
 
     std::map<std::uint32_t, const semantic::Resource*> resources;
     std::map<std::uint32_t, const semantic::ResourceUse*> uses;
@@ -411,8 +468,8 @@ base::Result<CompileOutput, CompileError> Compile(
 
     std::map<std::uint32_t, semantic::WorkKind> useWorkKinds;
     for (const auto& work : graph.works)
-        for (const auto useId : work.uses)
-            useWorkKinds[useId.value] = work.kind;
+        for (const auto& operand : work.operands)
+            useWorkKinds[operand.use.value] = work.kind;
 
     pkg::D3D12PackageDescription description;
     description.profile.minimumFeatureLevel = targetProfile.minimumFeatureLevel;
@@ -540,7 +597,7 @@ base::Result<CompileOutput, CompileError> Compile(
                 }
                 if (sourceResource.lifetime == semantic::LifetimeIntent::Temporal)
                     view.flags = static_cast<std::uint32_t>(
-                        sourceUse->role == semantic::ViewRole::TemporalPreviousBuffer ?
+                        sourceUse->temporalRelation == semantic::TemporalRelation::Previous ?
                         pkg::ResourceViewFlags::TemporalPrevious : pkg::ResourceViewFlags::TemporalCurrent);
 
                 if (DescriptorBacked(view.viewClass))
@@ -626,39 +683,26 @@ base::Result<CompileOutput, CompileError> Compile(
         }
     }
 
-    // G6: start from committed allocations, then safely coalesce each explicit
-    // AliasedBuffer target with one compatible, frame-unused Preparation resource.
+    // Stage D: alias intent belongs to Resource, not to a shader-input role.
+    // SemanticAnalysis has already validated shape compatibility and exclusive
+    // ownership of each Preparation resource.
     std::map<std::uint32_t, analysis::ResourceLifetime> lifetimes;
     for (const auto& lifetime : analyzed.resourceLifetimes)
         lifetimes[lifetime.resource.value] = lifetime;
     std::map<std::uint32_t, std::uint32_t> aliasPairs;
-    std::set<std::uint32_t> usedPreparations;
-    for (const auto& use : graph.resourceUses)
+    for (const auto resourceId : analyzed.canonicalResourceOrder)
     {
-        if (use.role != semantic::ViewRole::AliasedBuffer) continue;
-        const auto& targetResource = *resources.at(use.resource.value);
-        for (const auto preparationId : analyzed.canonicalResourceOrder)
-        {
-            const auto& preparation = *resources.at(preparationId.value);
-            if (usedPreparations.contains(preparation.id.value) ||
-                preparation.lifetime != semantic::LifetimeIntent::Preparation ||
-                preparation.kind != targetResource.kind ||
-                lifetimes.at(preparation.id.value).usedByWork)
-                continue;
-            const auto& targetLifetime = lifetimes.at(targetResource.id.value);
-            const auto& preparationLifetime = lifetimes.at(preparation.id.value);
-            const bool nonOverlapping = !preparationLifetime.usedByWork || !targetLifetime.usedByWork ||
-                preparationLifetime.lastUse < targetLifetime.firstUse ||
-                targetLifetime.lastUse < preparationLifetime.firstUse;
-            if (!nonOverlapping) continue;
-            const bool compatible = preparation.kind == semantic::ResourceKind::Buffer &&
-                preparation.buffer.sizeBytes == targetResource.buffer.sizeBytes &&
-                preparation.buffer.strideBytes == targetResource.buffer.strideBytes;
-            if (!compatible) continue;
-            aliasPairs[preparation.id.value] = targetResource.id.value;
-            usedPreparations.insert(preparation.id.value);
-            break;
-        }
+        const auto& targetResource = *resources.at(resourceId.value);
+        if (!targetResource.aliasPreparation.IsValid()) continue;
+        const auto& preparation = *resources.at(targetResource.aliasPreparation.value);
+        const auto& targetLifetime = lifetimes.at(targetResource.id.value);
+        const auto& preparationLifetime = lifetimes.at(preparation.id.value);
+        const bool nonOverlapping = !preparationLifetime.usedByWork || !targetLifetime.usedByWork ||
+            preparationLifetime.lastUse < targetLifetime.firstUse ||
+            targetLifetime.lastUse < preparationLifetime.firstUse;
+        if (!nonOverlapping)
+            return Failure<CompileOutput>("allocation-planning", "explicit alias Resource lifetimes overlap");
+        aliasPairs[preparation.id.value] = targetResource.id.value;
     }
 
     std::map<std::uint32_t, pkg::AllocationId> allocationForResource;
@@ -763,67 +807,72 @@ base::Result<CompileOutput, CompileError> Compile(
             work.raster.program : work.compute.program;
         const auto& sourceProgram = *programs.at(sourceProgramId.value);
 
-        std::vector<const semantic::ResourceUse*> bindingUses;
-        for (const auto useId : work.uses)
-        {
-            const auto* use = uses.at(useId.value);
-            if (use->role == semantic::ViewRole::ConstantData || IsShaderResource(use->role) ||
-                use->role == semantic::ViewRole::StorageBuffer)
-                bindingUses.push_back(use);
-        }
+        std::vector<const semantic::WorkOperand*> bindingOperands;
+        for (const auto& operand : work.operands)
+            if (operand.kind == semantic::WorkOperandKind::ProgramParameter)
+                bindingOperands.push_back(&operand);
+        std::sort(bindingOperands.begin(), bindingOperands.end(), [](const auto* left, const auto* right) {
+            return left->parameter.value < right->parameter.value;
+        });
 
         const std::uint32_t rootCost = static_cast<std::uint32_t>(std::count_if(
-            bindingUses.begin(), bindingUses.end(), [](const auto* use) {
-                return use->role == semantic::ViewRole::ConstantData;
+            bindingOperands.begin(), bindingOperands.end(), [&](const auto* operand) {
+                return sourceProgram.interface.parameters[operand->parameter.value].kind ==
+                       semantic::ProgramParameterKind::ConstantBuffer;
             })) * 2u + static_cast<std::uint32_t>(std::count_if(
-            bindingUses.begin(), bindingUses.end(), [](const auto* use) {
-                return use->role != semantic::ViewRole::ConstantData;
+            bindingOperands.begin(), bindingOperands.end(), [&](const auto* operand) {
+                return sourceProgram.interface.parameters[operand->parameter.value].kind !=
+                       semantic::ProgramParameterKind::ConstantBuffer;
             }));
         if (rootCost > 64)
             return Failure<CompileOutput>("binding-layout", "root signature exceeds the D3D12 64-DWORD limit");
 
         const pkg::BindingLayoutId layoutId{static_cast<std::uint32_t>(description.bindingLayouts.size())};
         const auto parameterFirst = static_cast<std::uint32_t>(description.rootParameters.size());
-        std::uint32_t srvRegister = 0;
-        std::uint32_t uavRegister = 0;
         std::uint32_t descriptorCount = 0;
         std::vector<NativeBinding> nativeBindings;
-        for (std::uint32_t index = 0; index < bindingUses.size(); ++index)
+        bool hasStaticSampler = false;
+        for (std::uint32_t index = 0; index < bindingOperands.size(); ++index)
         {
-            const auto* use = bindingUses[index];
+            const auto* operand = bindingOperands[index];
+            const auto* use = uses.at(operand->use.value);
+            const auto& sourceParameter = sourceProgram.interface.parameters[operand->parameter.value];
             pkg::RootParameterArtifact parameter;
             parameter.id = {static_cast<std::uint32_t>(description.rootParameters.size())};
             parameter.rootParameterIndex = index;
-            parameter.visibility = work.kind == semantic::WorkKind::Raster ?
-                (use->role == semantic::ViewRole::ConstantData ? pkg::ShaderVisibility::Vertex : pkg::ShaderVisibility::Pixel) :
-                pkg::ShaderVisibility::All;
-            if (use->role == semantic::ViewRole::ConstantData)
+            parameter.shaderRegister = sourceParameter.shaderRegister;
+            parameter.visibility = sourceParameter.stage == semantic::ShaderStage::Vertex ?
+                pkg::ShaderVisibility::Vertex :
+                sourceParameter.stage == semantic::ShaderStage::Pixel ?
+                pkg::ShaderVisibility::Pixel : pkg::ShaderVisibility::All;
+            switch (sourceParameter.kind)
             {
+            case semantic::ProgramParameterKind::ConstantBuffer:
                 parameter.kind = pkg::RootParameterKind::ConstantBuffer;
-                parameter.shaderRegister = 0;
                 parameter.dynamicSlot = dynamicSlots.at(use->resource.value);
-                nativeBindings.push_back({NativeBindingKind::Constant, 0});
-            }
-            else if (use->role == semantic::ViewRole::StorageBuffer)
-            {
+                nativeBindings.push_back({NativeBindingKind::Constant, parameter.shaderRegister, sourceParameter.stage});
+                break;
+            case semantic::ProgramParameterKind::UnorderedBuffer:
                 parameter.kind = pkg::RootParameterKind::UnorderedAccessTable;
-                parameter.shaderRegister = uavRegister++;
                 parameter.staticView = viewMap.at(use->id.value);
-                nativeBindings.push_back({NativeBindingKind::UnorderedAccess, parameter.shaderRegister});
+                nativeBindings.push_back({NativeBindingKind::UnorderedAccess, parameter.shaderRegister, sourceParameter.stage});
                 ++descriptorCount;
-            }
-            else
-            {
+                break;
+            case semantic::ProgramParameterKind::SampledTexture:
+                hasStaticSampler = true;
+                [[fallthrough]];
+            case semantic::ProgramParameterKind::ReadOnlyBuffer:
                 parameter.kind = pkg::RootParameterKind::ShaderResourceTable;
-                parameter.shaderRegister = srvRegister++;
                 parameter.staticView = viewMap.at(use->id.value);
-                nativeBindings.push_back({NativeBindingKind::ShaderResource, parameter.shaderRegister});
+                nativeBindings.push_back({NativeBindingKind::ShaderResource, parameter.shaderRegister, sourceParameter.stage});
                 ++descriptorCount;
+                break;
+            default:
+                return Failure<CompileOutput>("binding-layout", "ProgramParameter kind is unsupported");
             }
             description.rootParameters.push_back(parameter);
         }
 
-        const bool hasStaticSampler = sourceProgram.interface.sampledTextureCount != 0;
         auto rootBytes = SerializeBindingLayout(nativeBindings,
             work.kind == semantic::WorkKind::Raster, hasStaticSampler);
         if (!rootBytes) return base::Result<CompileOutput, CompileError>::Failure(rootBytes.Error());
@@ -832,7 +881,7 @@ base::Result<CompileOutput, CompileError> Compile(
         layout.id = layoutId;
         layout.rootSignatureMajor = targetProfile.rootSignatureMajor;
         layout.rootSignatureMinor = targetProfile.rootSignatureMinor;
-        layout.parameterRange = {parameterFirst, static_cast<std::uint32_t>(bindingUses.size())};
+        layout.parameterRange = {parameterFirst, static_cast<std::uint32_t>(bindingOperands.size())};
         layout.descriptorRange = {descriptorBindingOffset, descriptorCount};
         layout.staticSamplerRange = {staticSamplerOffset, hasStaticSampler ? 1u : 0u};
         layout.serializedRootSignature = {package::SectionKind::NativeObjectData, 0,
@@ -881,12 +930,12 @@ base::Result<CompileOutput, CompileError> Compile(
             const semantic::ResourceUse* vertex = nullptr;
             const semantic::ResourceUse* color = nullptr;
             const semantic::ResourceUse* depth = nullptr;
-            for (const auto useId : work.uses)
+            for (const auto& operand : work.operands)
             {
-                const auto* use = uses.at(useId.value);
-                if (use->role == semantic::ViewRole::VertexData) vertex = use;
-                if (use->role == semantic::ViewRole::ColorAttachment) color = use;
-                if (use->role == semantic::ViewRole::DepthAttachment) depth = use;
+                const auto* use = uses.at(operand.use.value);
+                if (operand.kind == semantic::WorkOperandKind::VertexData) vertex = use;
+                if (operand.kind == semantic::WorkOperandKind::ColorAttachment) color = use;
+                if (operand.kind == semantic::WorkOperandKind::DepthAttachment) depth = use;
             }
             artifacts.rasterExecutable = {static_cast<std::uint32_t>(description.executables.size())};
             pkg::RasterExecutableArtifact executable;
@@ -1067,9 +1116,9 @@ base::Result<CompileOutput, CompileError> Compile(
     for (std::uint32_t position = 0; position < analyzed.canonicalWorkOrder.size(); ++position)
     {
         const auto& work = *works.at(analyzed.canonicalWorkOrder[position].value);
-        for (const auto useId : work.uses)
+        for (const auto& operand : work.operands)
         {
-            const auto* use = uses.at(useId.value);
+            const auto* use = uses.at(operand.use.value);
             if (externalSlots.contains(use->resource.value) && !firstExternalUse.contains(use->resource.value))
                 firstExternalUse[use->resource.value] = position;
         }
@@ -1079,7 +1128,7 @@ base::Result<CompileOutput, CompileError> Compile(
         const auto& source = *resources.at(use.resource.value);
         std::uint32_t relation = 0;
         if (source.lifetime == semantic::LifetimeIntent::Temporal)
-            relation = use.role == semantic::ViewRole::TemporalPreviousBuffer ? 2u : 1u;
+            relation = use.temporalRelation == semantic::TemporalRelation::Previous ? 2u : 1u;
         return StateCell{resourceMap.at(use.resource.value).value, relation};
     };
     const auto baselineState = [&](StateCell cell) {
@@ -1117,14 +1166,14 @@ base::Result<CompileOutput, CompileError> Compile(
                 addOperation(pkg::D3D12OperationCode::WaitQueue, queue,
                              pkg::Encode(pkg::WaitQueuePayload{producerQueue}));
         }
-        for (const auto useId : work.uses)
+        for (const auto& operand : work.operands)
         {
-            const auto* use = uses.at(useId.value);
+            const auto* use = uses.at(operand.use.value);
             const auto first = firstExternalUse.find(use->resource.value);
             if (first != firstExternalUse.end() && first->second == position)
                 addOperation(pkg::D3D12OperationCode::WaitExternal, queue,
                              pkg::Encode(pkg::WaitExternalPayload{externalSlots.at(use->resource.value)}));
-            if (use->role == semantic::ViewRole::TemporalPreviousBuffer)
+            if (use->temporalRelation == semantic::TemporalRelation::Previous)
                 addOperation(pkg::D3D12OperationCode::WaitTemporal, queue,
                              pkg::Encode(pkg::WaitTemporalPayload{resourceMap.at(use->resource.value)}));
         }
@@ -1133,16 +1182,16 @@ base::Result<CompileOutput, CompileError> Compile(
         std::map<StateCell, const semantic::ResourceUse*> activeUses;
         std::set<std::uint32_t> rasterPresentationResources;
         if (work.kind == semantic::WorkKind::Raster)
-            for (const auto useId : work.uses)
+            for (const auto& operand : work.operands)
             {
-                const auto* use = uses.at(useId.value);
-                if (use->role == semantic::ViewRole::PresentSource)
+                const auto* use = uses.at(operand.use.value);
+                if (operand.kind == semantic::WorkOperandKind::PresentSource)
                     rasterPresentationResources.insert(use->resource.value);
             }
 
-        for (const auto useId : work.uses)
+        for (const auto& operand : work.operands)
         {
-            const auto* use = uses.at(useId.value);
+            const auto* use = uses.at(operand.use.value);
             if (work.kind == semantic::WorkKind::Raster && use->role == semantic::ViewRole::PresentSource)
                 continue;
             const auto cell = cellFor(*use);
@@ -1156,8 +1205,17 @@ base::Result<CompileOutput, CompileError> Compile(
 
         if (work.kind == semantic::WorkKind::Copy)
         {
-            const auto* sourceUse = uses.at(work.copy.source.value);
-            const auto* destinationUse = uses.at(work.copy.destination.value);
+            const semantic::ResourceUse* sourceUse = nullptr;
+            const semantic::ResourceUse* destinationUse = nullptr;
+            for (const auto& operand : work.operands)
+            {
+                if (operand.kind == semantic::WorkOperandKind::CopySource)
+                    sourceUse = uses.at(operand.use.value);
+                if (operand.kind == semantic::WorkOperandKind::CopyDestination)
+                    destinationUse = uses.at(operand.use.value);
+            }
+            if (sourceUse == nullptr || destinationUse == nullptr)
+                return Failure<CompileOutput>("operation-lowering", "validated Copy Work has missing operands");
             addOperation(pkg::D3D12OperationCode::ExecuteCopy, queue,
                 pkg::Encode(pkg::CopyBufferPayload{resourceMap.at(sourceUse->resource.value),
                     resourceMap.at(destinationUse->resource.value), 0, 0, work.copy.bytes}));
@@ -1171,10 +1229,10 @@ base::Result<CompileOutput, CompileError> Compile(
         {
             addOperation(pkg::D3D12OperationCode::ExecuteRaster, queue,
                 pkg::Encode(pkg::ExecuteRasterPayload{workArtifacts.at(work.id.value).rasterCommand}));
-            for (const auto useId : work.uses)
+            for (const auto& operand : work.operands)
             {
-                const auto* use = uses.at(useId.value);
-                if (use->role != semantic::ViewRole::PresentSource) continue;
+                const auto* use = uses.at(operand.use.value);
+                if (operand.kind != semantic::WorkOperandKind::PresentSource) continue;
                 const auto cell = cellFor(*use);
                 emitTransition(queue, viewMap.at(use->id.value), cell, Present());
                 activeUses[cell] = use;
@@ -1189,9 +1247,9 @@ base::Result<CompileOutput, CompileError> Compile(
             for (std::uint32_t next = position + 1; next < analyzed.canonicalWorkOrder.size() && !nextFound; ++next)
             {
                 const auto& nextWork = *works.at(analyzed.canonicalWorkOrder[next].value);
-                for (const auto nextUseId : nextWork.uses)
+                for (const auto& nextOperand : nextWork.operands)
                 {
-                    const auto* nextUse = uses.at(nextUseId.value);
+                    const auto* nextUse = uses.at(nextOperand.use.value);
                     if (cellFor(*nextUse) != cell) continue;
                     desired = workQueues.at(nextWork.id.value) == queue ? RequiredState(nextUse->role, nextWork.kind) : Common();
                     nextFound = true;

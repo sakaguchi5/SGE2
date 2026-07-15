@@ -62,10 +62,15 @@ public:
         std::string debugName,
         FormatMeaning formatMeaning);
 
+    [[nodiscard]] base::Result<void, std::string> SetAliasPreparation(
+        ResourceId target,
+        ResourceId preparation);
+
     [[nodiscard]] base::Result<ResourceUseId, std::string> AddUse(
         ResourceId resource,
         Effect effect,
-        ViewRole role);
+        ViewRole role,
+        TemporalRelation temporalRelation = TemporalRelation::Current);
 
     [[nodiscard]] base::Result<ProgramId, std::string> AddRasterProgram(
         std::string debugName,
@@ -77,27 +82,10 @@ public:
         ProgramInterface interfaceDescription,
         ProgramSource source);
 
-    [[nodiscard]] base::Result<WorkId, std::string> AddRasterWork(
-        std::string debugName,
-        ProgramId program,
-        ResourceUseId vertexData,
-        ResourceUseId constantData,
-        ResourceUseId sampledTexture,
-        ResourceUseId computedData,
-        ResourceUseId copiedData,
-        ResourceUseId aliasedData,
-        ResourceUseId externalData,
-        ResourceUseId colorAttachment,
-        ResourceUseId depthAttachment,
-        ResourceUseId presentSource,
-        std::uint32_t vertexCount);
-
-    // Cardinality-independent form. Resource roles in `uses` define vertex,
-    // bindings, attachments, and presentation relations.
     [[nodiscard]] base::Result<WorkId, std::string> AddRasterWorkGeneric(
         std::string debugName,
         ProgramId program,
-        std::span<const ResourceUseId> uses,
+        std::span<const WorkOperand> operands,
         std::uint32_t vertexCount);
 
     [[nodiscard]] base::Result<WorkId, std::string> AddCopyWork(
@@ -106,20 +94,10 @@ public:
         ResourceUseId destination,
         std::uint64_t bytes);
 
-    [[nodiscard]] base::Result<WorkId, std::string> AddComputeWork(
-        std::string debugName,
-        ProgramId program,
-        ResourceUseId constantData,
-        ResourceUseId previous,
-        ResourceUseId output,
-        std::uint32_t threadGroupCountX,
-        std::uint32_t threadGroupCountY,
-        std::uint32_t threadGroupCountZ);
-
     [[nodiscard]] base::Result<WorkId, std::string> AddComputeWorkGeneric(
         std::string debugName,
         ProgramId program,
-        std::span<const ResourceUseId> uses,
+        std::span<const WorkOperand> operands,
         std::uint32_t threadGroupCountX,
         std::uint32_t threadGroupCountY,
         std::uint32_t threadGroupCountZ);
@@ -135,6 +113,11 @@ public:
     [[nodiscard]] SemanticGraph Build() &&;
 
 private:
+    [[nodiscard]] base::Result<void, std::string> ValidateOperands(
+        ProgramId program,
+        std::span<const WorkOperand> operands,
+        ProgramKind expectedKind) const;
+
     SemanticGraph graph_;
 };
 }

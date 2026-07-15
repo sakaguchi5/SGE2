@@ -42,7 +42,7 @@ This repository now contains the Level 1 to Level 2 compiler generalization stag
 
 - The safe baseline is one committed allocation per Package-owned Resource.
 - Allocation class, alignment, and physical instance count are derived from resource requirements.
-- A compatible Preparation resource and AliasedBuffer target may share one placed allocation when their load/frame lifetimes do not overlap.
+- A compatible Preparation resource and an explicit Resource.aliasPreparation target may share one placed allocation when their load/frame lifetimes do not overlap. Stage D removed alias origin from shader-input roles.
 - Alias activation order is emitted explicitly.
 
 ## G7 - Generic binding and Package lowering

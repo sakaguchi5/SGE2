@@ -12,10 +12,12 @@ namespace sge::semantic
 struct ResourceTag;
 struct ResourceUseTag;
 struct ProgramTag;
+struct ProgramParameterTag;
 struct WorkTag;
 using ResourceId = base::Id32<ResourceTag>;
 using ResourceUseId = base::Id32<ResourceUseTag>;
 using ProgramId = base::Id32<ProgramTag>;
+using ProgramParameterId = base::Id32<ProgramParameterTag>;
 using WorkId = base::Id32<WorkTag>;
 
 enum class ResourceKind : std::uint16_t { Buffer = 1, Texture2D = 2, SurfaceImage = 3 };
@@ -24,6 +26,10 @@ enum class LifetimeIntent : std::uint16_t { Persistent = 1, FrameLocal = 2, Temp
 enum class UpdateIntent : std::uint16_t { Immutable = 1, DynamicPerFrame = 2, External = 3, GpuWritten = 4 };
 enum class Visibility : std::uint16_t { Internal = 1, Published = 2 };
 enum class Effect : std::uint16_t { Read = 1, Write = 2, ReadWrite = 3 };
+
+// A ResourceUse describes the view required by one Work. It deliberately does
+// not encode where the Resource came from (compute/copy/external/alias). Those
+// facts belong to Resource lifetime/update/alias contracts and graph edges.
 enum class ViewRole : std::uint16_t
 {
     VertexData = 1,
@@ -33,16 +39,32 @@ enum class ViewRole : std::uint16_t
     PresentSource = 5,
     DepthAttachment = 6,
     StorageBuffer = 7,
-    ComputedBuffer = 8,
+    ShaderBuffer = 8,
     CopySource = 9,
-    CopyDestination = 10,
-    CopiedBuffer = 11,
-    TemporalPreviousBuffer = 12,
-    AliasedBuffer = 13,
-    ExternalBuffer = 14
+    CopyDestination = 10
 };
+
+enum class TemporalRelation : std::uint16_t { Current = 1, Previous = 2 };
 enum class WorkKind : std::uint16_t { Raster = 1, Compute = 2, Copy = 3, Present = 4 };
 enum class ProgramKind : std::uint16_t { Raster = 1, Compute = 2 };
+enum class ProgramParameterKind : std::uint16_t
+{
+    ConstantBuffer = 1,
+    SampledTexture = 2,
+    ReadOnlyBuffer = 3,
+    UnorderedBuffer = 4
+};
+enum class ShaderStage : std::uint16_t { Vertex = 1, Pixel = 2, Compute = 3 };
+enum class WorkOperandKind : std::uint16_t
+{
+    ProgramParameter = 1,
+    VertexData = 2,
+    ColorAttachment = 3,
+    DepthAttachment = 4,
+    PresentSource = 5,
+    CopySource = 6,
+    CopyDestination = 7
+};
 
 struct BufferShape final
 {
@@ -86,6 +108,10 @@ struct Resource final
     DynamicDataContract dynamicData;
     SurfaceShape surface;
     std::vector<std::byte> initialContent;
+
+    // Optional explicit alias contract. The target Resource may reuse the
+    // compatible Preparation Resource allocation after lifetime validation.
+    ResourceId aliasPreparation;
 };
 
 struct ResourceUse final
@@ -94,6 +120,7 @@ struct ResourceUse final
     ResourceId resource;
     Effect effect = Effect::Read;
     ViewRole role = ViewRole::VertexData;
+    TemporalRelation temporalRelation = TemporalRelation::Current;
 };
 
 struct VertexInput final
@@ -104,15 +131,22 @@ struct VertexInput final
     std::uint32_t byteOffset = 0;
 };
 
+struct ProgramParameter final
+{
+    ProgramParameterId id;
+    std::string debugName;
+    ProgramParameterKind kind = ProgramParameterKind::ConstantBuffer;
+    ShaderStage stage = ShaderStage::Vertex;
+    std::uint32_t shaderRegister = 0;
+    std::uint64_t requiredBytes = 0;
+    std::uint32_t requiredAlignment = 1;
+};
+
 struct ProgramInterface final
 {
     std::vector<VertexInput> vertexInputs;
     std::uint32_t vertexStrideBytes = 0;
-    std::uint64_t constantDataBytes = 0;
-    std::uint32_t constantDataAlignment = 1;
-    std::uint32_t sampledTextureCount = 0;
-    std::uint32_t sampledBufferCount = 0;
-    std::uint32_t unorderedBufferCount = 0;
+    std::vector<ProgramParameter> parameters;
 };
 
 struct ProgramSource final
@@ -132,35 +166,30 @@ struct Program final
     ProgramSource source;
 };
 
+// Every ResourceUse owned by a Work appears exactly once as a WorkOperand.
+// Program bindings refer to a stable parameter identity instead of relying on
+// ResourceUse vector order or role-count conventions.
+struct WorkOperand final
+{
+    WorkOperandKind kind = WorkOperandKind::ProgramParameter;
+    ResourceUseId use;
+    ProgramParameterId parameter;
+};
+
 struct RasterPayload final
 {
     ProgramId program;
-    ResourceUseId vertexData;
-    ResourceUseId constantData;
-    ResourceUseId sampledTexture;
-    ResourceUseId computedData;
-    ResourceUseId copiedData;
-    ResourceUseId aliasedData;
-    ResourceUseId externalData;
-    ResourceUseId colorAttachment;
-    ResourceUseId depthAttachment;
-    ResourceUseId presentSource;
     std::uint32_t vertexCount = 0;
 };
 
 struct CopyPayload final
 {
-    ResourceUseId source;
-    ResourceUseId destination;
     std::uint64_t bytes = 0;
 };
 
 struct ComputePayload final
 {
     ProgramId program;
-    ResourceUseId constantData;
-    ResourceUseId previous;
-    ResourceUseId output;
     std::uint32_t threadGroupCountX = 1;
     std::uint32_t threadGroupCountY = 1;
     std::uint32_t threadGroupCountZ = 1;
@@ -171,7 +200,7 @@ struct Work final
     WorkId id;
     std::string debugName;
     WorkKind kind = WorkKind::Raster;
-    std::vector<ResourceUseId> uses;
+    std::vector<WorkOperand> operands;
     // Optional semantic ordering constraints. The compiler also derives hazard
     // edges from ResourceUse; these edges are only for relations that cannot be
     // inferred from resource effects (for example, an intentional WAR order).

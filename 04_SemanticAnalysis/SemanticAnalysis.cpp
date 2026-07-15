@@ -55,21 +55,6 @@ bool IsWrite(Effect effect) noexcept
     return effect == Effect::Write || effect == Effect::ReadWrite;
 }
 
-bool IsSampledBuffer(ViewRole role) noexcept
-{
-    switch (role)
-    {
-    case ViewRole::ComputedBuffer:
-    case ViewRole::CopiedBuffer:
-    case ViewRole::TemporalPreviousBuffer:
-    case ViewRole::AliasedBuffer:
-    case ViewRole::ExternalBuffer:
-        return true;
-    default:
-        return false;
-    }
-}
-
 std::uint32_t WorkKindRank(WorkKind kind) noexcept
 {
     switch (kind)
@@ -233,96 +218,252 @@ void ValidateProgram(const Program& program, std::uint32_t source,
         Push(diagnostics, "program kind is unknown", source);
     }
 
-    if (program.interface.constantDataBytes != 0 &&
-        !base::IsPowerOfTwo(program.interface.constantDataAlignment))
-        Push(diagnostics, "program constant-data alignment must be a power of two", source);
+    std::set<std::pair<std::uint16_t, std::uint32_t>> registerKeys;
+    for (std::size_t index = 0; index < program.interface.parameters.size(); ++index)
+    {
+        const auto& parameter = program.interface.parameters[index];
+        if (!parameter.id.IsValid() || parameter.id.value != index)
+            Push(diagnostics, "ProgramParameter IDs must be dense and ordered", source);
+
+        const bool rasterStage = parameter.stage == ShaderStage::Vertex || parameter.stage == ShaderStage::Pixel;
+        if ((program.kind == ProgramKind::Raster && !rasterStage) ||
+            (program.kind == ProgramKind::Compute && parameter.stage != ShaderStage::Compute))
+            Push(diagnostics, "ProgramParameter stage is incompatible with Program kind", source);
+
+        std::uint16_t registerClass = 0;
+        switch (parameter.kind)
+        {
+        case ProgramParameterKind::ConstantBuffer:
+            registerClass = 1;
+            if (parameter.requiredBytes == 0 || !base::IsPowerOfTwo(parameter.requiredAlignment))
+                Push(diagnostics, "constant-buffer parameter requires bytes and power-of-two alignment", source);
+            break;
+        case ProgramParameterKind::SampledTexture:
+            registerClass = 2;
+            if (parameter.stage != ShaderStage::Pixel || parameter.requiredBytes != 0)
+                Push(diagnostics, "sampled-texture parameter must be a Pixel-stage texture", source);
+            break;
+        case ProgramParameterKind::ReadOnlyBuffer:
+            registerClass = 2;
+            if (parameter.stage == ShaderStage::Vertex || parameter.requiredBytes != 0)
+                Push(diagnostics, "read-only-buffer parameter must be Pixel or Compute stage", source);
+            break;
+        case ProgramParameterKind::UnorderedBuffer:
+            registerClass = 3;
+            if (parameter.stage != ShaderStage::Compute || parameter.requiredBytes != 0)
+                Push(diagnostics, "unordered-buffer parameter is limited to Compute stage in Level 2 v1", source);
+            break;
+        default:
+            Push(diagnostics, "ProgramParameter kind is unknown", source);
+            break;
+        }
+        if (registerClass != 0 && !registerKeys.insert({registerClass, parameter.shaderRegister}).second)
+            Push(diagnostics, "ProgramParameter register is duplicated within its register class", source);
+    }
+}
+
+void ValidateResourceUse(const ResourceUse& use, const Resource& resource,
+                         std::uint32_t source, std::vector<Diagnostic>& diagnostics)
+{
+    const bool read = IsRead(use.effect);
+    const bool write = IsWrite(use.effect);
+    switch (use.role)
+    {
+    case ViewRole::VertexData:
+        if (resource.kind != ResourceKind::Buffer || !read || write)
+            Push(diagnostics, "VertexData requires a read-only Buffer", source);
+        break;
+    case ViewRole::ConstantData:
+        if (resource.kind != ResourceKind::Buffer || resource.update != UpdateIntent::DynamicPerFrame || !read || write)
+            Push(diagnostics, "ConstantData requires a read-only DynamicPerFrame Buffer", source);
+        break;
+    case ViewRole::SampledTexture:
+        if (resource.kind != ResourceKind::Texture2D || resource.texture2D.formatMeaning != FormatMeaning::Bgra8Unorm || !read || write)
+            Push(diagnostics, "SampledTexture requires a read-only Bgra8Unorm Texture2D", source);
+        break;
+    case ViewRole::ShaderBuffer:
+        if (resource.kind != ResourceKind::Buffer || !read || write)
+            Push(diagnostics, "ShaderBuffer requires a read-only Buffer", source);
+        break;
+    case ViewRole::StorageBuffer:
+        if (resource.kind != ResourceKind::Buffer || !write || resource.update != UpdateIntent::GpuWritten)
+            Push(diagnostics, "StorageBuffer requires a GPU-written Buffer with write effect", source);
+        break;
+    case ViewRole::ColorAttachment:
+        if (resource.kind != ResourceKind::SurfaceImage || !write)
+            Push(diagnostics, "Level 2 v1 ColorAttachment requires a writable SurfaceImage", source);
+        break;
+    case ViewRole::DepthAttachment:
+        if (resource.kind != ResourceKind::Texture2D ||
+            resource.texture2D.formatMeaning != FormatMeaning::Depth32Float || !write)
+            Push(diagnostics, "DepthAttachment requires a writable Depth32Float Texture2D", source);
+        break;
+    case ViewRole::PresentSource:
+        if (resource.kind != ResourceKind::SurfaceImage || !read || write)
+            Push(diagnostics, "PresentSource requires a read-only SurfaceImage", source);
+        break;
+    case ViewRole::CopySource:
+        if (resource.kind != ResourceKind::Buffer || !read || write)
+            Push(diagnostics, "Level 2 v1 CopySource requires a read-only Buffer", source);
+        break;
+    case ViewRole::CopyDestination:
+        if (resource.kind != ResourceKind::Buffer || !write)
+            Push(diagnostics, "Level 2 v1 CopyDestination requires a writable Buffer", source);
+        break;
+    default:
+        Push(diagnostics, "ResourceUse role is unknown", source);
+        break;
+    }
+
+    if (use.temporalRelation == TemporalRelation::Previous)
+    {
+        if (resource.lifetime != LifetimeIntent::Temporal || use.role != ViewRole::ShaderBuffer || !read || write)
+            Push(diagnostics, "Previous temporal relation requires a read-only ShaderBuffer use of a Temporal resource", source);
+    }
+    else if (use.temporalRelation != TemporalRelation::Current)
+    {
+        Push(diagnostics, "ResourceUse temporal relation is unknown", source);
+    }
+}
+
+bool ParameterRoleMatches(ProgramParameterKind kind, ViewRole role) noexcept
+{
+    switch (kind)
+    {
+    case ProgramParameterKind::ConstantBuffer: return role == ViewRole::ConstantData;
+    case ProgramParameterKind::SampledTexture: return role == ViewRole::SampledTexture;
+    case ProgramParameterKind::ReadOnlyBuffer: return role == ViewRole::ShaderBuffer;
+    case ProgramParameterKind::UnorderedBuffer: return role == ViewRole::StorageBuffer;
+    default: return false;
+    }
 }
 
 void ValidateWorkInterface(const Work& work, const Program* program,
                            const std::map<std::uint32_t, const ResourceUse*>& uses,
+                           const std::map<std::uint32_t, const Resource*>& resources,
                            std::uint32_t source, std::vector<Diagnostic>& diagnostics)
 {
     std::uint32_t vertex = 0;
-    std::uint32_t constants = 0;
-    std::uint32_t sampledTextures = 0;
-    std::uint32_t sampledBuffers = 0;
-    std::uint32_t unorderedBuffers = 0;
     std::uint32_t color = 0;
     std::uint32_t depth = 0;
     std::uint32_t present = 0;
     std::uint32_t copySource = 0;
     std::uint32_t copyDestination = 0;
-
     std::set<std::uint32_t> uniqueUses;
-    for (const auto useId : work.uses)
+    std::set<std::uint32_t> boundParameters;
+    const ResourceUse* colorUse = nullptr;
+    const ResourceUse* presentUse = nullptr;
+    const ResourceUse* copySourceUse = nullptr;
+    const ResourceUse* copyDestinationUse = nullptr;
+
+    for (const auto& operand : work.operands)
     {
-        if (!uniqueUses.insert(useId.value).second)
-            Push(diagnostics, "work contains a duplicate ResourceUse", source);
-        const auto found = uses.find(useId.value);
-        if (!useId.IsValid() || found == uses.end())
+        if (!operand.use.IsValid() || !uniqueUses.insert(operand.use.value).second)
+            Push(diagnostics, "Work operands must contain unique valid ResourceUse IDs", source);
+        const auto found = uses.find(operand.use.value);
+        if (found == uses.end())
         {
-            Push(diagnostics, "work references an unknown ResourceUse", source);
+            Push(diagnostics, "Work operand references an unknown ResourceUse", source);
             continue;
         }
-        switch (found->second->role)
+        const auto* use = found->second;
+        switch (operand.kind)
         {
-        case ViewRole::VertexData: ++vertex; break;
-        case ViewRole::ConstantData: ++constants; break;
-        case ViewRole::SampledTexture: ++sampledTextures; break;
-        case ViewRole::StorageBuffer: ++unorderedBuffers; break;
-        case ViewRole::ColorAttachment: ++color; break;
-        case ViewRole::DepthAttachment: ++depth; break;
-        case ViewRole::PresentSource: ++present; break;
-        case ViewRole::CopySource: ++copySource; break;
-        case ViewRole::CopyDestination: ++copyDestination; break;
+        case WorkOperandKind::ProgramParameter:
+        {
+            if (program == nullptr || !operand.parameter.IsValid() ||
+                operand.parameter.value >= program->interface.parameters.size())
+            {
+                Push(diagnostics, "ProgramParameter operand references an unknown parameter", source);
+                break;
+            }
+            if (!boundParameters.insert(operand.parameter.value).second)
+                Push(diagnostics, "ProgramParameter is bound more than once", source);
+            const auto& parameter = program->interface.parameters[operand.parameter.value];
+            if (!ParameterRoleMatches(parameter.kind, use->role))
+                Push(diagnostics, "ProgramParameter kind does not match ResourceUse role", source);
+            else
+            {
+                const auto resourceFound = resources.find(use->resource.value);
+                if (resourceFound != resources.end() && parameter.kind == ProgramParameterKind::ConstantBuffer)
+                {
+                    const auto* resource = resourceFound->second;
+                    if (resource->dynamicData.requiredBytes != parameter.requiredBytes ||
+                        resource->dynamicData.requiredAlignment < parameter.requiredAlignment)
+                        Push(diagnostics, "constant-buffer parameter size/alignment does not match the bound Resource", source);
+                }
+            }
+            break;
+        }
+        case WorkOperandKind::VertexData:
+            ++vertex;
+            if (use->role != ViewRole::VertexData) Push(diagnostics, "VertexData operand role mismatch", source);
+            break;
+        case WorkOperandKind::ColorAttachment:
+            ++color; colorUse = use;
+            if (use->role != ViewRole::ColorAttachment) Push(diagnostics, "ColorAttachment operand role mismatch", source);
+            break;
+        case WorkOperandKind::DepthAttachment:
+            ++depth;
+            if (use->role != ViewRole::DepthAttachment) Push(diagnostics, "DepthAttachment operand role mismatch", source);
+            break;
+        case WorkOperandKind::PresentSource:
+            ++present; presentUse = use;
+            if (use->role != ViewRole::PresentSource) Push(diagnostics, "PresentSource operand role mismatch", source);
+            break;
+        case WorkOperandKind::CopySource:
+            ++copySource; copySourceUse = use;
+            if (use->role != ViewRole::CopySource) Push(diagnostics, "CopySource operand role mismatch", source);
+            break;
+        case WorkOperandKind::CopyDestination:
+            ++copyDestination; copyDestinationUse = use;
+            if (use->role != ViewRole::CopyDestination) Push(diagnostics, "CopyDestination operand role mismatch", source);
+            break;
         default:
-            if (IsSampledBuffer(found->second->role)) ++sampledBuffers;
+            Push(diagnostics, "WorkOperand kind is unknown", source);
             break;
         }
     }
 
+    if (program != nullptr && boundParameters.size() != program->interface.parameters.size())
+        Push(diagnostics, "Work must bind every ProgramParameter exactly once", source);
+
     if (work.kind == WorkKind::Raster)
     {
-        if (program == nullptr || program->kind != ProgramKind::Raster ||
-            work.raster.vertexCount == 0)
-        {
+        if (program == nullptr || program->kind != ProgramKind::Raster || work.raster.vertexCount == 0)
             Push(diagnostics, "raster work contract is incomplete", source);
-            return;
-        }
-        const auto expectedConstants = program->interface.constantDataBytes == 0 ? 0u : 1u;
-        if (vertex != 1 || color != 1 || depth > 1 || present > 1 ||
-            constants != expectedConstants ||
-            sampledTextures != program->interface.sampledTextureCount ||
-            sampledBuffers != program->interface.sampledBufferCount ||
-            unorderedBuffers != program->interface.unorderedBufferCount)
-            Push(diagnostics, "raster work uses do not match ProgramInterface", source);
+        if (vertex != 1 || color != 1 || depth > 1 || present != 1 || copySource != 0 || copyDestination != 0)
+            Push(diagnostics, "raster work operand structure is outside Level 2 v1", source);
+        if (colorUse != nullptr && presentUse != nullptr && colorUse->resource != presentUse->resource)
+            Push(diagnostics, "raster ColorAttachment and PresentSource must reference the same SurfaceImage", source);
     }
     else if (work.kind == WorkKind::Compute)
     {
         if (program == nullptr || program->kind != ProgramKind::Compute ||
             work.compute.threadGroupCountX == 0 || work.compute.threadGroupCountY == 0 ||
             work.compute.threadGroupCountZ == 0)
-        {
             Push(diagnostics, "compute work contract is incomplete", source);
-            return;
-        }
-        const auto expectedConstants = program->interface.constantDataBytes == 0 ? 0u : 1u;
-        if (vertex != 0 || color != 0 || depth != 0 || present != 0 ||
-            constants != expectedConstants ||
-            sampledTextures != program->interface.sampledTextureCount ||
-            sampledBuffers != program->interface.sampledBufferCount ||
-            unorderedBuffers != program->interface.unorderedBufferCount)
-            Push(diagnostics, "compute work uses do not match ProgramInterface", source);
+        if (vertex != 0 || color != 0 || depth != 0 || present != 0 || copySource != 0 || copyDestination != 0)
+            Push(diagnostics, "compute work may contain only ProgramParameter operands", source);
     }
     else if (work.kind == WorkKind::Copy)
     {
-        if (copySource != 1 || copyDestination != 1 || work.copy.bytes == 0 ||
-            work.uses.size() != 2)
+        if (program != nullptr || copySource != 1 || copyDestination != 1 ||
+            work.copy.bytes == 0 || work.operands.size() != 2)
             Push(diagnostics, "copy work contract is incomplete", source);
+        if (copySourceUse != nullptr && copyDestinationUse != nullptr)
+        {
+            const auto sourceResource = resources.find(copySourceUse->resource.value);
+            const auto destinationResource = resources.find(copyDestinationUse->resource.value);
+            if (sourceResource != resources.end() && destinationResource != resources.end() &&
+                (work.copy.bytes > sourceResource->second->buffer.sizeBytes ||
+                 work.copy.bytes > destinationResource->second->buffer.sizeBytes))
+                Push(diagnostics, "copy work byte range exceeds a Buffer", source);
+        }
     }
     else if (work.kind == WorkKind::Present)
     {
-        if (present != 1 || work.uses.size() != 1)
+        if (program != nullptr || present != 1 || work.operands.size() != 1)
             Push(diagnostics, "present work contract is incomplete", source);
     }
     else
@@ -357,8 +498,11 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
     for (std::size_t index = 0; index < graph.resourceUses.size(); ++index)
     {
         const auto& use = graph.resourceUses[index];
-        if (!use.resource.IsValid() || resources.find(use.resource.value) == resources.end())
+        const auto found = resources.find(use.resource.value);
+        if (!use.resource.IsValid() || found == resources.end())
             Push(diagnostics, "ResourceUse references an unknown resource", static_cast<std::uint32_t>(index));
+        else
+            ValidateResourceUse(use, *found->second, static_cast<std::uint32_t>(index), diagnostics);
         if (use.effect != Effect::Read && use.effect != Effect::Write && use.effect != Effect::ReadWrite)
             Push(diagnostics, "ResourceUse effect is unknown", static_cast<std::uint32_t>(index));
     }
@@ -366,6 +510,7 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
     for (std::size_t index = 0; index < graph.programs.size(); ++index)
         ValidateProgram(graph.programs[index], static_cast<std::uint32_t>(index), diagnostics);
 
+    std::map<std::uint32_t, std::uint32_t> useOwners;
     for (std::size_t index = 0; index < graph.works.size(); ++index)
     {
         const auto& work = graph.works[index];
@@ -379,7 +524,8 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
             if (found != programs.end()) program = found->second;
             else Push(diagnostics, "work references an unknown program", static_cast<std::uint32_t>(index));
         }
-        ValidateWorkInterface(work, program, uses, static_cast<std::uint32_t>(index), diagnostics);
+        ValidateWorkInterface(work, program, uses, resources, static_cast<std::uint32_t>(index), diagnostics);
+        for (const auto& operand : work.operands) ++useOwners[operand.use.value];
 
         for (const auto dependency : work.dependencies)
             if (!dependency.IsValid() || dependency == work.id || works.find(dependency.value) == works.end())
@@ -388,34 +534,47 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
 
     for (const auto& [id, use] : uses)
     {
+        const auto ownerCount = useOwners[id];
+        if (ownerCount != 1)
+            Push(diagnostics, "each ResourceUse must be owned by exactly one Work operand", id);
         const auto resource = resources.find(use->resource.value);
         if (resource != resources.end() && resource->second->lifetime == LifetimeIntent::Preparation)
-        {
-            const bool referenced = std::any_of(graph.works.begin(), graph.works.end(), [id](const Work& work) {
-                return std::any_of(work.uses.begin(), work.uses.end(), [id](ResourceUseId useId) { return useId.value == id; });
-            });
-            if (referenced) Push(diagnostics, "Preparation resource cannot be referenced by frame Work", id);
-        }
-
-        if (resource != resources.end() && use->role == ViewRole::AliasedBuffer)
-        {
-            const auto* aliased = resource->second;
-            const bool compatiblePreparation = std::any_of(graph.resources.begin(), graph.resources.end(),
-                [aliased](const Resource& candidate) {
-                    if (candidate.lifetime != LifetimeIntent::Preparation || candidate.kind != aliased->kind)
-                        return false;
-                    if (candidate.kind == ResourceKind::Buffer)
-                        return candidate.buffer.sizeBytes == aliased->buffer.sizeBytes &&
-                               candidate.buffer.strideBytes == aliased->buffer.strideBytes;
-                    return candidate.texture2D.extentMeaning == aliased->texture2D.extentMeaning &&
-                           candidate.texture2D.width == aliased->texture2D.width &&
-                           candidate.texture2D.height == aliased->texture2D.height &&
-                           candidate.texture2D.formatMeaning == aliased->texture2D.formatMeaning;
-                });
-            if (!compatiblePreparation)
-                Push(diagnostics, "AliasedBuffer requires a compatible Preparation resource", id);
-        }
+            Push(diagnostics, "Preparation resource cannot be referenced by frame Work", id);
     }
+
+    std::set<std::uint32_t> usedPreparations;
+    for (const auto& resource : graph.resources)
+    {
+        if (!resource.aliasPreparation.IsValid()) continue;
+        const auto preparation = resources.find(resource.aliasPreparation.value);
+        if (preparation == resources.end())
+        {
+            Push(diagnostics, "alias contract references an unknown Preparation resource", resource.id.value);
+            continue;
+        }
+        if (!usedPreparations.insert(resource.aliasPreparation.value).second)
+            Push(diagnostics, "one Preparation resource cannot back multiple alias targets in Level 2 v1", resource.id.value);
+        if (resource.lifetime == LifetimeIntent::Preparation ||
+            resource.lifetime == LifetimeIntent::External ||
+            resource.kind == ResourceKind::SurfaceImage)
+            Push(diagnostics, "alias target must be a package-owned Buffer or Texture2D", resource.id.value);
+        const auto* candidate = preparation->second;
+        if (candidate->lifetime != LifetimeIntent::Preparation || candidate->kind != resource.kind)
+            Push(diagnostics, "alias preparation kind/lifetime is incompatible", resource.id.value);
+        else if (resource.kind == ResourceKind::Buffer &&
+                 (candidate->buffer.sizeBytes != resource.buffer.sizeBytes ||
+                  candidate->buffer.strideBytes != resource.buffer.strideBytes))
+            Push(diagnostics, "alias Buffer shapes are incompatible", resource.id.value);
+        else if (resource.kind == ResourceKind::Texture2D &&
+                 (candidate->texture2D.extentMeaning != resource.texture2D.extentMeaning ||
+                  candidate->texture2D.width != resource.texture2D.width ||
+                  candidate->texture2D.height != resource.texture2D.height ||
+                  candidate->texture2D.formatMeaning != resource.texture2D.formatMeaning))
+            Push(diagnostics, "alias Texture2D shapes are incompatible", resource.id.value);
+    }
+    for (const auto& resource : graph.resources)
+        if (resource.lifetime == LifetimeIntent::Preparation && !usedPreparations.contains(resource.id.value))
+            Push(diagnostics, "Preparation resource must be owned by exactly one alias contract", resource.id.value);
 
     if (!diagnostics.empty())
         return base::Result<AnalyzedGraph, std::vector<Diagnostic>>::Failure(std::move(diagnostics));
@@ -444,9 +603,9 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
     std::map<std::uint32_t, std::vector<Access>> accesses;
     for (const auto& [workId, work] : works)
     {
-        for (const auto useId : work->uses)
+        for (const auto& operand : work->operands)
         {
-            const auto found = uses.find(useId.value);
+            const auto found = uses.find(operand.use.value);
             if (found != uses.end()) accesses[found->second->resource.value].push_back({work, found->second});
         }
     }
@@ -458,7 +617,7 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         for (const auto& access : resourceAccesses)
         {
             if (IsWrite(access.use->effect)) writers.push_back(access);
-            if (IsRead(access.use->effect) && access.use->role != ViewRole::TemporalPreviousBuffer)
+            if (IsRead(access.use->effect) && access.use->temporalRelation != TemporalRelation::Previous)
                 readers.push_back(access);
         }
 
@@ -546,8 +705,8 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         lifetime.resource = resourceId;
         for (const auto& [workId, work] : works)
         {
-            const auto used = std::any_of(work->uses.begin(), work->uses.end(), [&](ResourceUseId useId) {
-                const auto found = uses.find(useId.value);
+            const auto used = std::any_of(work->operands.begin(), work->operands.end(), [&](const WorkOperand& operand) {
+                const auto found = uses.find(operand.use.value);
                 return found != uses.end() && found->second->resource == resourceId;
             });
             if (!used) continue;
@@ -558,7 +717,6 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
         }
         output.resourceLifetimes.push_back(lifetime);
     }
-
     return base::Result<AnalyzedGraph, std::vector<Diagnostic>>::Success(std::move(output));
 }
 }
