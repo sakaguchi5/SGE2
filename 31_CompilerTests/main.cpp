@@ -116,6 +116,30 @@ bool ReplaceOnce(std::string& text, std::string_view before, std::string_view af
     return true;
 }
 
+sem::SemanticGraph MakeCrossQueueTemporal(sem::SemanticGraph graph)
+{
+    const auto temporal = std::find_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
+        return resource.lifetime == sem::LifetimeIntent::Temporal;
+    });
+    const auto raster = std::find_if(graph.works.begin(), graph.works.end(), [](const auto& work) {
+        return work.kind == sem::WorkKind::Raster;
+    });
+    for (const auto& operand : raster->operands)
+    {
+        if (operand.kind != sem::WorkOperandKind::ProgramParameter) continue;
+        auto use = std::find_if(graph.resourceUses.begin(), graph.resourceUses.end(), [&](const auto& candidate) {
+            return candidate.id == operand.use;
+        });
+        if (use != graph.resourceUses.end() && use->resource == temporal->id &&
+            use->role == sem::ViewRole::ShaderBuffer)
+        {
+            use->temporalRelation = sem::TemporalRelation::Previous;
+            return graph;
+        }
+    }
+    std::terminate();
+}
+
 sem::SemanticGraph AddRasterBinding(sem::SemanticGraph graph)
 {
     const auto source = std::find_if(graph.resources.begin(), graph.resources.end(), [](const auto& resource) {
@@ -155,6 +179,56 @@ std::uint32_t Count(std::span<const pkg::OperationView> operations, pkg::D3D12Op
     return static_cast<std::uint32_t>(std::count_if(operations.begin(), operations.end(), [code](const auto& operation) {
         return operation.opcode == code;
     }));
+}
+
+bool ValidateSignalIdentityContract(std::span<const pkg::OperationView> operations)
+{
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::size_t>> signals;
+    for (std::size_t index = 0; index < operations.size(); ++index)
+    {
+        const auto& operation = operations[index];
+        if (operation.opcode != pkg::D3D12OperationCode::SignalQueue) continue;
+        auto payload = pkg::DecodeSignalQueue(operation.payload);
+        if (!payload || !payload.Value().signalPoint.IsValid() ||
+            !signals.emplace(payload.Value().signalPoint.value,
+                std::pair{operation.queue.value, index}).second)
+            return false;
+    }
+    for (std::uint32_t id = 0; id < signals.size(); ++id)
+        if (!signals.contains(id)) return false;
+
+    for (std::size_t index = 0; index < operations.size(); ++index)
+    {
+        const auto& operation = operations[index];
+        const bool stageFOperation =
+            operation.opcode == pkg::D3D12OperationCode::SignalQueue ||
+            operation.opcode == pkg::D3D12OperationCode::WaitQueue ||
+            operation.opcode == pkg::D3D12OperationCode::WaitTemporal ||
+            operation.opcode == pkg::D3D12OperationCode::ReleaseExternal;
+        if (stageFOperation && operation.operationVersion != 2) return false;
+
+        if (operation.opcode == pkg::D3D12OperationCode::WaitQueue)
+        {
+            auto payload = pkg::DecodeWaitQueue(operation.payload);
+            if (!payload || !signals.contains(payload.Value().signalPoint.value) ||
+                signals.at(payload.Value().signalPoint.value).second >= index ||
+                signals.at(payload.Value().signalPoint.value).first == operation.queue.value)
+                return false;
+        }
+        else if (operation.opcode == pkg::D3D12OperationCode::WaitTemporal)
+        {
+            auto payload = pkg::DecodeWaitTemporal(operation.payload);
+            if (!payload || !signals.contains(payload.Value().producerSignalPoint.value)) return false;
+        }
+        else if (operation.opcode == pkg::D3D12OperationCode::ReleaseExternal)
+        {
+            auto payload = pkg::DecodeReleaseExternal(operation.payload);
+            if (!payload || !signals.contains(payload.Value().releaseSignalPoint.value) ||
+                signals.at(payload.Value().releaseSignalPoint.value).second >= index)
+                return false;
+        }
+    }
+    return true;
 }
 }
 
@@ -226,8 +300,8 @@ int main()
 
     auto frozen = sge::package::PackageReader::Read(first.Value().packageBytes);
     if (!frozen) { std::cerr << frozen.Error().message << '\n'; return 6; }
-    if (frozen.Value().Header().targetSchemaVersion != 14 ||
-        frozen.Value().Header().minimumRuntimeVersion != 14)
+    if (frozen.Value().Header().targetSchemaVersion != 15 ||
+        frozen.Value().Header().minimumRuntimeVersion != 15)
         return 7;
     auto decoded = pkg::D3D12PackageView::Decode(frozen.Value());
     if (!decoded) { std::cerr << decoded.Error().message << '\n'; return 8; }
@@ -311,6 +385,11 @@ int main()
     if (Count(frame, pkg::D3D12OperationCode::WaitQueue) == 0 ||
         Count(frame, pkg::D3D12OperationCode::WaitTemporal) == 0)
         return 18;
+    if (!ValidateSignalIdentityContract(frame))
+    {
+        std::cerr << "Stage-F signal identity contract is not explicit or internally consistent\n";
+        return 39;
+    }
 
     const auto transitionCount = Count(frame, pkg::D3D12OperationCode::Transition);
     if (transitionCount == 0) return 19;
@@ -375,6 +454,40 @@ int main()
         Count(multiViewResult.Value().FrameOperations(), pkg::D3D12OperationCode::WaitQueue) < 2)
         return 31;
 
+    auto crossQueueTemporalGraph = MakeCrossQueueTemporal(graph);
+    auto crossQueueTemporal = sge::compiler::d3d12::Compile(crossQueueTemporalGraph, multiQueueProfile);
+    if (!crossQueueTemporal)
+    {
+        std::cerr << crossQueueTemporal.Error().stage << ": " << crossQueueTemporal.Error().message << '\n';
+        return 40;
+    }
+    auto crossFrozen = sge::package::PackageReader::Read(crossQueueTemporal.Value().packageBytes);
+    if (!crossFrozen) return 41;
+    auto crossViewResult = pkg::D3D12PackageView::Decode(crossFrozen.Value());
+    if (!crossViewResult) return 42;
+    std::map<std::uint32_t, std::uint32_t> signalQueues;
+    for (const auto& operation : crossViewResult.Value().FrameOperations())
+        if (operation.opcode == pkg::D3D12OperationCode::SignalQueue)
+        {
+            auto payload = pkg::DecodeSignalQueue(operation.payload);
+            if (!payload) return 43;
+            signalQueues[payload.Value().signalPoint.value] = operation.queue.value;
+        }
+    bool directWaitsForPreviousCompute = false;
+    for (const auto& operation : crossViewResult.Value().FrameOperations())
+        if (operation.opcode == pkg::D3D12OperationCode::WaitTemporal && operation.queue.value == 0)
+        {
+            auto payload = pkg::DecodeWaitTemporal(operation.payload);
+            if (!payload || !signalQueues.contains(payload.Value().producerSignalPoint.value)) return 44;
+            if (signalQueues.at(payload.Value().producerSignalPoint.value) == 1)
+                directWaitsForPreviousCompute = true;
+        }
+    if (!directWaitsForPreviousCompute)
+    {
+        std::cerr << "cross-queue Temporal wait did not reference the Compute producer signal point\n";
+        return 45;
+    }
+
     auto invalidQueues = profile;
     invalidQueues.directQueueCount = 2;
     auto queueCapability = sge::compiler::d3d12::ValidateLevel2Capability(graph, invalidQueues);
@@ -431,6 +544,6 @@ int main()
         return 38;
     }
 
-    std::cout << "Stage-E typed pipeline, shader reflection, static completeness, capability rejection, and generic Package lowering tests passed.\n";
+    std::cout << "Stage-F explicit signal identity, Temporal/External boundary ABI, Stage-E typed pipeline, reflection, and generic Package lowering tests passed.\n";
     return 0;
 }

@@ -16,7 +16,7 @@ template<class Tag> using Id32 = base::Id32<Tag>;
 struct ResourceTag; struct AllocationTag; struct ViewTag; struct ShaderTag; struct ProgramTag;
 struct BindingLayoutTag; struct ExecutableTag; struct RasterCommandTag; struct DynamicSlotTag;
 struct ExternalSlotTag; struct SurfaceSlotTag; struct QueueTag; struct AttachmentOperationTag;
-struct RootParameterTag; struct ComputeExecutableTag; struct ComputeCommandTag;
+struct RootParameterTag; struct ComputeExecutableTag; struct ComputeCommandTag; struct SignalPointTag;
 using ResourceId = Id32<ResourceTag>;
 using AllocationId = Id32<AllocationTag>;
 using ViewId = Id32<ViewTag>;
@@ -33,6 +33,7 @@ using AttachmentOperationId = Id32<AttachmentOperationTag>;
 using RootParameterId = Id32<RootParameterTag>;
 using ComputeExecutableId = Id32<ComputeExecutableTag>;
 using ComputeCommandId = Id32<ComputeCommandTag>;
+using SignalPointId = Id32<SignalPointTag>;
 
 struct IndexRange final { std::uint32_t first = 0; std::uint32_t count = 0; };
 struct BlobRef final
@@ -499,9 +500,10 @@ struct CopyBufferPayload final
     std::uint64_t destinationOffset = 0;
     std::uint64_t bytes = 0;
 };
-struct WaitQueuePayload final { QueueId producerQueue; };
-struct WaitTemporalPayload final { ResourceId resource; };
+struct SignalQueuePayload final { SignalPointId signalPoint; };
+struct WaitQueuePayload final { SignalPointId signalPoint; };
+struct WaitTemporalPayload final { ResourceId resource; SignalPointId producerSignalPoint; };
 struct ActivateAliasPayload final { ResourceId before; ResourceId after; };
-struct ReleaseExternalPayload final { ExternalSlotId slot; };
+struct ReleaseExternalPayload final { ExternalSlotId slot; SignalPointId releaseSignalPoint; };
 struct PresentSurfacePayload final { SurfaceSlotId slot; };
 }

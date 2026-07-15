@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,8 +18,8 @@ namespace sge::package::d3d12_v13
 {
 namespace
 {
-constexpr std::uint32_t TargetSchemaVersion = 14;
-constexpr std::uint32_t MinimumRuntimeVersion = 14;
+constexpr std::uint32_t TargetSchemaVersion = 15;
+constexpr std::uint32_t MinimumRuntimeVersion = 15;
 constexpr std::uint32_t ManifestStride = 72;
 constexpr std::uint32_t ProfileStride = 80;
 constexpr std::uint32_t ResourceStride = 96;
@@ -357,7 +358,7 @@ base::Result<TargetProfile, PackageError> DecodeProfileRecord(base::BinaryReader
         profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc ||
         profile.shaderModelMajor != 5 || profile.shaderModelMinor > 1 ||
         profile.rootSignatureMajor != 1 || profile.rootSignatureMinor > 1)
-        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v14 capability", section));
+        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v15 capability", section));
     return base::Result<TargetProfile, PackageError>::Success(profile);
 }
 
@@ -896,6 +897,20 @@ base::Result<RawOperation, PackageError> DecodeOperation(base::BinaryReader& rea
     return base::Result<RawOperation, PackageError>::Success(value);
 }
 
+std::uint16_t ExpectedOperationVersion(D3D12OperationCode code)
+{
+    switch (code)
+    {
+    case D3D12OperationCode::SignalQueue:
+    case D3D12OperationCode::WaitQueue:
+    case D3D12OperationCode::WaitTemporal:
+    case D3D12OperationCode::ReleaseExternal:
+        return 2;
+    default:
+        return 1;
+    }
+}
+
 bool KnownOpcode(D3D12OperationCode code)
 {
     switch (code)
@@ -932,133 +947,6 @@ bool KnownOpcode(D3D12OperationCode code)
     }
 }
 
-base::Result<void, PackageError> ValidateSliceOperations(const D3D12PackageView& view)
-{
-    const QueueId noQueue{};
-    const QueueId directQueue{0};
-    const QueueId copyQueue{1};
-    const auto fail = [](const char* message)
-    {
-        return base::Result<void, PackageError>::Failure(
-            Error(PackageErrorCode::InvalidOperationStream, message, SectionKind::OperationTable));
-    };
-    const auto envelope = [](const OperationView& operation, D3D12OperationCode code, QueueId queue)
-    {
-        return operation.opcode == code && operation.operationVersion == 1 && operation.flags == 0 && operation.queue == queue;
-    };
-
-    const auto load = view.LoadOperations();
-    if (load.size() != 48) return fail("Slice 13 load stream cardinality is invalid");
-    if (!envelope(load[0], D3D12OperationCode::CreateDescriptorHeaps, noQueue) || !load[0].payload.empty())
-        return fail("Slice 13 load stream must begin with CreateDescriptorHeaps");
-    std::size_t index = 1;
-    for (const std::uint32_t resource : {0u,1u,2u,3u,4u,5u,6u,8u,9u})
-    {
-        if (!envelope(load[index], D3D12OperationCode::CreateResource, noQueue)) return fail("CreateResource order is invalid");
-        auto payload = DecodeCreateResource(load[index++].payload);
-        if (!payload || payload.Value().resource.value != resource) return fail("CreateResource payload is invalid");
-    }
-    if (!envelope(load[index], D3D12OperationCode::BeginQueueBatch, copyQueue)) return fail("load Copy batch is missing");
-    std::uint32_t commonToCopyDestinationCount = 0;
-    const ResourceState commonState{StateClass::Common, 0, 0};
-    const ResourceState copyDestinationState{StateClass::Explicit, 0,
-        static_cast<std::uint32_t>(ExplicitStateBits::CopyDestination)};
-    for (const auto& operation : load)
-    {
-        if (operation.queue == copyQueue && operation.opcode == D3D12OperationCode::InitializeState)
-        {
-            auto payload = DecodeInitializeState(operation.payload);
-            if (!payload || !IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))
-                return fail("Copy queue load transition uses a state outside Common/CopySource/CopyDestination");
-            if (payload.Value().before == commonState && payload.Value().after == copyDestinationState)
-                ++commonToCopyDestinationCount;
-        }
-    }
-    if (commonToCopyDestinationCount != 5)
-        return fail("Slice 13 must explicitly prepare five default buffers from COMMON to CopyDestination");
-    if (!envelope(load[load.size()-4], D3D12OperationCode::CreateRootSignature, noQueue) ||
-        !envelope(load[load.size()-3], D3D12OperationCode::CreateRootSignature, noQueue) ||
-        !envelope(load[load.size()-2], D3D12OperationCode::CreateGraphicsPipeline, noQueue) ||
-        !envelope(load[load.size()-1], D3D12OperationCode::CreateComputePipeline, noQueue))
-        return fail("pipeline materialization order is invalid");
-
-    const auto frame = view.FrameOperations();
-    const std::array<D3D12OperationCode, 36> codes = {
-        D3D12OperationCode::ApplyDynamicData,
-        D3D12OperationCode::AcquireExternal,
-        D3D12OperationCode::WaitExternal,
-        D3D12OperationCode::BeginQueueBatch,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::ExecuteCopy,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::EndQueueBatch,
-        D3D12OperationCode::SignalQueue,
-        D3D12OperationCode::WaitQueue,
-        D3D12OperationCode::WaitTemporal,
-        D3D12OperationCode::AcquireSurfaceImage,
-        D3D12OperationCode::BeginQueueBatch,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::ExecuteCompute,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::ExecuteRaster,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::Transition,
-        D3D12OperationCode::EndQueueBatch,
-        D3D12OperationCode::PresentSurface,
-        D3D12OperationCode::SignalQueue,
-        D3D12OperationCode::ReleaseExternal
-    };
-    if (frame.size() != codes.size()) return fail("Slice 13 frame stream cardinality is invalid");
-    for (std::size_t i = 0; i < frame.size(); ++i)
-    {
-        QueueId queue = noQueue;
-        if (i == 2 || i == 11 || i == 12 || (i >= 14 && i <= 32) || i == 34) queue = directQueue;
-        if (i >= 3 && i <= 10) queue = copyQueue;
-        if (!envelope(frame[i], codes[i], queue)) return fail("Slice 13 frame operation order or queue is invalid");
-    }
-    for (const auto& operation : frame)
-    {
-        if (operation.queue == copyQueue && operation.opcode == D3D12OperationCode::Transition)
-        {
-            auto payload = DecodeTransition(operation.payload);
-            if (!payload || !IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))
-                return fail("Copy queue frame transition uses a state outside Common/CopySource/CopyDestination");
-        }
-    }
-    auto acquireExternal = DecodeAcquireExternal(frame[1].payload);
-    auto waitExternal = DecodeWaitExternal(frame[2].payload);
-    auto releaseExternal = DecodeReleaseExternal(frame[35].payload);
-    if (!acquireExternal || acquireExternal.Value().slot.value != 0 ||
-        !waitExternal || waitExternal.Value().slot.value != 0 ||
-        !releaseExternal || releaseExternal.Value().slot.value != 0)
-        return fail("external acquire/wait/release payload is invalid");
-    auto waitQueue = DecodeWaitQueue(frame[11].payload);
-    auto waitTemporal = DecodeWaitTemporal(frame[12].payload);
-    auto executeCopy = DecodeCopyBuffer(frame[6].payload);
-    auto executeCompute = DecodeExecuteCompute(frame[20].payload);
-    auto executeRaster = DecodeExecuteRaster(frame[24].payload);
-    if (!waitQueue || waitQueue.Value().producerQueue.value != 1 ||
-        !waitTemporal || waitTemporal.Value().resource.value != 4 ||
-        !executeCopy || executeCopy.Value().source.value != 5 || executeCopy.Value().destination.value != 6 || executeCopy.Value().bytes != 16 ||
-        !executeCompute || executeCompute.Value().command.value != 0 ||
-        !executeRaster || executeRaster.Value().command.value != 0)
-        return fail("Slice 13 work/handoff payload is invalid");
-    return base::Result<void, PackageError>::Success();
-}
-
 base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view)
 {
     const auto fail = [](const char* message)
@@ -1090,10 +978,27 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
         -> base::Result<void, PackageError>
     {
         std::vector<bool> batchOpen(static_cast<std::size_t>(queueCount), false);
-        for (const auto& operation : operations)
+        std::map<std::uint32_t, std::pair<QueueId, std::size_t>> signalPoints;
+        std::uint32_t nextSignalPoint = 0;
+        for (std::size_t index = 0; index < operations.size(); ++index)
         {
-            if (!KnownOpcode(operation.opcode) || operation.operationVersion != 1 || operation.flags != 0)
-                return fail("operation envelope is invalid");
+            const auto& operation = operations[index];
+            if (operation.opcode != D3D12OperationCode::SignalQueue) continue;
+            auto payload = DecodeSignalQueue(operation.payload);
+            if (!payload || !payload.Value().signalPoint.IsValid() ||
+                payload.Value().signalPoint.value != nextSignalPoint++ ||
+                !validQueue(operation.queue) ||
+                !signalPoints.emplace(payload.Value().signalPoint.value,
+                    std::pair{operation.queue, index}).second)
+                return fail("SignalQueue identities must be valid, dense, and unique within each stream");
+        }
+
+        for (std::size_t operationIndex = 0; operationIndex < operations.size(); ++operationIndex)
+        {
+            const auto& operation = operations[operationIndex];
+            const auto expectedVersion = ExpectedOperationVersion(operation.opcode);
+            if (!KnownOpcode(operation.opcode) || operation.operationVersion != expectedVersion || operation.flags != 0)
+                return fail("operation envelope or operation version is invalid");
 
             const bool metadataOperation =
                 operation.opcode == D3D12OperationCode::CreateDescriptorHeaps ||
@@ -1284,32 +1189,42 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                 break;
             }
             case D3D12OperationCode::SignalQueue:
-                if (!operation.payload.empty() || batchOpen[operation.queue.value])
-                    return fail("SignalQueue must be outside a queue batch");
+            {
+                auto payload = DecodeSignalQueue(operation.payload);
+                const auto signal = payload ? signalPoints.find(payload.Value().signalPoint.value) : signalPoints.end();
+                if (!payload || signal == signalPoints.end() || signal->second.first != operation.queue ||
+                    signal->second.second != operationIndex || batchOpen[operation.queue.value])
+                    return fail("SignalQueue must declare its dense identity outside a queue batch");
                 break;
+            }
             case D3D12OperationCode::WaitQueue:
             {
                 auto payload = DecodeWaitQueue(operation.payload);
-                if (!payload || !validQueue(payload.Value().producerQueue) ||
-                    payload.Value().producerQueue == operation.queue || batchOpen[operation.queue.value])
-                    return fail("WaitQueue payload is invalid");
+                const auto signal = payload ? signalPoints.find(payload.Value().signalPoint.value) : signalPoints.end();
+                if (!payload || signal == signalPoints.end() || signal->second.second >= operationIndex ||
+                    signal->second.first == operation.queue || batchOpen[operation.queue.value])
+                    return fail("WaitQueue must reference a preceding signal point on another queue");
                 break;
             }
             case D3D12OperationCode::WaitTemporal:
             {
                 auto payload = DecodeWaitTemporal(operation.payload);
-                if (load || !payload || !resourceValid(payload.Value().resource) ||
+                const auto signal = payload ? signalPoints.find(payload.Value().producerSignalPoint.value) : signalPoints.end();
+                if (load || !payload || !resourceValid(payload.Value().resource) || signal == signalPoints.end() ||
+                    batchOpen[operation.queue.value] ||
                     (view.Resources()[payload.Value().resource.value].flags &
                      static_cast<std::uint32_t>(ResourceFlags::Temporal)) == 0)
-                    return fail("WaitTemporal payload is invalid");
+                    return fail("WaitTemporal must reference a Temporal resource and a declared previous-frame producer signal");
                 break;
             }
             case D3D12OperationCode::ReleaseExternal:
             {
                 auto payload = DecodeReleaseExternal(operation.payload);
+                const auto signal = payload ? signalPoints.find(payload.Value().releaseSignalPoint.value) : signalPoints.end();
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.ExternalSlots().size())
-                    return fail("ReleaseExternal payload is invalid");
+                    payload.Value().slot.value >= view.ExternalSlots().size() ||
+                    signal == signalPoints.end() || signal->second.second >= operationIndex)
+                    return fail("ReleaseExternal must reference a preceding last-use signal point");
                 break;
             }
             case D3D12OperationCode::PresentSurface:
@@ -2031,7 +1946,7 @@ base::Result<D3D12PackageView, PackageError> D3D12PackageView::Decode(const Froz
     for (std::size_t i = 0; i < rawOperations.Value().size(); ++i)
     {
         const auto& raw = rawOperations.Value()[i];
-        if (!KnownOpcode(raw.opcode) || raw.version != 1)
+        if (!KnownOpcode(raw.opcode) || raw.version != ExpectedOperationVersion(raw.opcode))
         {
             auto error = Error(PackageErrorCode::InvalidOperationStream, "unknown operation or version", SectionKind::OperationTable);
             error.operationIndex = static_cast<std::uint32_t>(i);
@@ -2172,13 +2087,17 @@ std::vector<std::byte> Encode(const CopyBufferPayload& payload)
     writer.WriteU64(payload.bytes);
     return std::move(writer).Take();
 }
+std::vector<std::byte> Encode(const SignalQueuePayload& payload)
+{
+    base::BinaryWriter writer; WriteId(writer, payload.signalPoint); writer.WriteU32(0); return std::move(writer).Take();
+}
 std::vector<std::byte> Encode(const WaitQueuePayload& payload)
 {
-    base::BinaryWriter writer; WriteId(writer, payload.producerQueue); writer.WriteU32(0); return std::move(writer).Take();
+    base::BinaryWriter writer; WriteId(writer, payload.signalPoint); writer.WriteU32(0); return std::move(writer).Take();
 }
 std::vector<std::byte> Encode(const WaitTemporalPayload& payload)
 {
-    base::BinaryWriter writer; WriteId(writer, payload.resource); writer.WriteU32(0); return std::move(writer).Take();
+    base::BinaryWriter writer; WriteId(writer, payload.resource); WriteId(writer, payload.producerSignalPoint); return std::move(writer).Take();
 }
 std::vector<std::byte> Encode(const ActivateAliasPayload& payload)
 {
@@ -2186,7 +2105,7 @@ std::vector<std::byte> Encode(const ActivateAliasPayload& payload)
 }
 std::vector<std::byte> Encode(const ReleaseExternalPayload& payload)
 {
-    base::BinaryWriter writer; WriteId(writer, payload.slot); writer.WriteU32(0); return std::move(writer).Take();
+    base::BinaryWriter writer; WriteId(writer, payload.slot); WriteId(writer, payload.releaseSignalPoint); return std::move(writer).Take();
 }
 std::vector<std::byte> Encode(const PresentSurfacePayload& payload)
 {
@@ -2337,13 +2256,22 @@ base::Result<CopyBufferPayload, PackageError> DecodeCopyBuffer(std::span<const s
             {{source.Value()}, {destination.Value()}, sourceOffset.Value(), destinationOffset.Value(), count.Value()});
     });
 }
+base::Result<SignalQueuePayload, PackageError> DecodeSignalQueue(std::span<const std::byte> bytes)
+{
+    return DecodeIdPayload<SignalQueuePayload, SignalPointId>(bytes, "SignalQueue");
+}
 base::Result<WaitQueuePayload, PackageError> DecodeWaitQueue(std::span<const std::byte> bytes)
 {
-    return DecodeIdPayload<WaitQueuePayload, QueueId>(bytes, "WaitQueue");
+    return DecodeIdPayload<WaitQueuePayload, SignalPointId>(bytes, "WaitQueue");
 }
 base::Result<WaitTemporalPayload, PackageError> DecodeWaitTemporal(std::span<const std::byte> bytes)
 {
-    return DecodeIdPayload<WaitTemporalPayload, ResourceId>(bytes, "WaitTemporal");
+    return DecodePayload<WaitTemporalPayload>(bytes, 8, [](base::BinaryReader& reader) {
+        auto resource = reader.ReadU32(); auto signal = reader.ReadU32();
+        if (!resource || !signal) return base::Result<WaitTemporalPayload, PackageError>::Failure(
+            Error(PackageErrorCode::InvalidOperationStream, "WaitTemporal payload is truncated"));
+        return base::Result<WaitTemporalPayload, PackageError>::Success({{resource.Value()}, {signal.Value()}});
+    });
 }
 base::Result<ActivateAliasPayload, PackageError> DecodeActivateAlias(std::span<const std::byte> bytes)
 {
@@ -2355,7 +2283,12 @@ base::Result<ActivateAliasPayload, PackageError> DecodeActivateAlias(std::span<c
 }
 base::Result<ReleaseExternalPayload, PackageError> DecodeReleaseExternal(std::span<const std::byte> bytes)
 {
-    return DecodeIdPayload<ReleaseExternalPayload, ExternalSlotId>(bytes, "ReleaseExternal");
+    return DecodePayload<ReleaseExternalPayload>(bytes, 8, [](base::BinaryReader& reader) {
+        auto slot = reader.ReadU32(); auto signal = reader.ReadU32();
+        if (!slot || !signal) return base::Result<ReleaseExternalPayload, PackageError>::Failure(
+            Error(PackageErrorCode::InvalidOperationStream, "ReleaseExternal payload is truncated"));
+        return base::Result<ReleaseExternalPayload, PackageError>::Success({{slot.Value()}, {signal.Value()}});
+    });
 }
 base::Result<PresentSurfacePayload, PackageError> DecodePresentSurface(std::span<const std::byte> bytes)
 {

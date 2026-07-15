@@ -104,11 +104,12 @@ The capability vocabulary does not yet claim runtime qualification for:
 
 - surface-free Compute-only runtime execution
 - standalone Present Work lowering
-- temporal cross-queue producer signal identity
-- multiple resources per external boundary contract
+- WARP qualification of temporal cross-queue execution (the Stage-F ABI now represents it explicitly)
+- WARP qualification of multiple simultaneous external boundary slots
 - same-class multiple native queues
 - generated-graph qualification
 
 Stage E closes shader-interface reflection and Compiler static-completeness.
-The remaining items are closed by later Level 2 stages. Stage C/D establishes
-the accepted input language and removes Slice-derived operand identities.
+Stage F closes the Package ABI for exact current-frame waits, previous-frame
+Temporal producer waits, and External release completion through SignalPointId.
+The remaining runtime-shape qualifications are closed by later Level 2 stages.

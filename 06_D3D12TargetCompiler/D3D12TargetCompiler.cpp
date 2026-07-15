@@ -999,11 +999,11 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             slot.requiredKind = ResourceKind(source.kind);
             slot.requiredFormat = ResourceFormat(source);
             slot.minimumBytes = source.kind == semantic::ResourceKind::Buffer ? source.buffer.sizeBytes : 0;
-            const auto& sourceUses = resourceUses[source.id.value];
-            const auto state = sourceUses.empty() ? Common() : RequiredState(sourceUses.front()->role, useWorkKinds.at(sourceUses.front()->id.value));
-            slot.requiredIncomingState = state;
-            slot.guaranteedOutgoingState = state;
-            description.resources[packageResource.value].initialState = state;
+            // Stage F finalizes the boundary states from canonical first/last use,
+            // not from ResourceUse registration order.
+            slot.requiredIncomingState = Common();
+            slot.guaranteedOutgoingState = Common();
+            description.resources[packageResource.value].initialState = Common();
             externalSlots[source.id.value] = slot.id;
             description.externalSlots.push_back(slot);
         }
@@ -1337,10 +1337,40 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
                                    kind == semantic::WorkKind::Compute ? computeQueue : directQueue;
     }
 
+    // SignalPointId is local to one operation stream.  Frame points are assigned
+    // before lowering so WaitTemporal can reference a producer that appears later
+    // in the current frame but belongs to the previous frame generation.
+    std::map<std::uint32_t, pkg::SignalPointId> workSignalPoints;
+    std::uint32_t nextFrameSignalPoint = 0;
+    for (const auto workId : analyzed.canonicalWorkOrder)
+        workSignalPoints[workId.value] = {nextFrameSignalPoint++};
+    const pkg::SignalPointId presentSignalPoint = description.surfaceSlots.empty() ?
+        pkg::SignalPointId{} : pkg::SignalPointId{nextFrameSignalPoint++};
+
+    std::map<std::uint32_t, std::uint32_t> temporalCurrentWriterWork;
+    for (const auto workId : analyzed.canonicalWorkOrder)
+    {
+        const auto& work = *works.at(workId.value);
+        for (const auto& operand : work.operands)
+        {
+            const auto* use = uses.at(operand.use.value);
+            const auto& resource = *resources.at(use->resource.value);
+            if (resource.lifetime == semantic::LifetimeIntent::Temporal &&
+                use->temporalRelation == semantic::TemporalRelation::Current &&
+                (use->effect == semantic::Effect::Write || use->effect == semantic::Effect::ReadWrite))
+                temporalCurrentWriterWork[use->resource.value] = work.id.value;
+        }
+    }
+
     const auto addOperation = [&](pkg::D3D12OperationCode code, pkg::QueueId queue,
                                   std::vector<std::byte> payload = {})
     {
-        description.operations.push_back({code, 1, 0, queue, std::move(payload)});
+        const std::uint16_t operationVersion =
+            code == pkg::D3D12OperationCode::SignalQueue ||
+            code == pkg::D3D12OperationCode::WaitQueue ||
+            code == pkg::D3D12OperationCode::WaitTemporal ||
+            code == pkg::D3D12OperationCode::ReleaseExternal ? 2u : 1u;
+        description.operations.push_back({code, operationVersion, 0, queue, std::move(payload)});
     };
 
     addOperation(pkg::D3D12OperationCode::CreateDescriptorHeaps, noQueue);
@@ -1417,7 +1447,8 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
                     Explicit(pkg::ExplicitStateBits::CopySource), Common()}));
         }
         addOperation(pkg::D3D12OperationCode::EndQueueBatch, copyQueue);
-        addOperation(pkg::D3D12OperationCode::SignalQueue, copyQueue);
+        addOperation(pkg::D3D12OperationCode::SignalQueue, copyQueue,
+                     pkg::Encode(pkg::SignalQueuePayload{pkg::SignalPointId{0}}));
     }
 
     for (const auto& layout : description.bindingLayouts)
@@ -1445,15 +1476,35 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     for (std::uint32_t index = 0; index < analyzed.canonicalWorkOrder.size(); ++index)
         workPosition[analyzed.canonicalWorkOrder[index].value] = index;
     std::map<std::uint32_t, std::uint32_t> firstExternalUse;
+    std::map<std::uint32_t, std::uint32_t> lastExternalUse;
+    std::map<std::uint32_t, const semantic::ResourceUse*> firstExternalUseContract;
+    std::map<std::uint32_t, const semantic::ResourceUse*> lastExternalUseContract;
     for (std::uint32_t position = 0; position < analyzed.canonicalWorkOrder.size(); ++position)
     {
         const auto& work = *works.at(analyzed.canonicalWorkOrder[position].value);
         for (const auto& operand : work.operands)
         {
             const auto* use = uses.at(operand.use.value);
-            if (externalSlots.contains(use->resource.value) && !firstExternalUse.contains(use->resource.value))
+            if (!externalSlots.contains(use->resource.value)) continue;
+            if (!firstExternalUse.contains(use->resource.value))
+            {
                 firstExternalUse[use->resource.value] = position;
+                firstExternalUseContract[use->resource.value] = use;
+            }
+            lastExternalUse[use->resource.value] = position;
+            lastExternalUseContract[use->resource.value] = use;
         }
+    }
+    for (const auto& [resourceId, slotId] : externalSlots)
+    {
+        const auto firstUse = firstExternalUseContract.at(resourceId);
+        const auto lastUse = lastExternalUseContract.at(resourceId);
+        auto& slot = description.externalSlots[slotId.value];
+        slot.requiredIncomingState = RequiredState(firstUse->role,
+            useWorkKinds.at(firstUse->id.value));
+        slot.guaranteedOutgoingState = RequiredState(lastUse->role,
+            useWorkKinds.at(lastUse->id.value));
+        description.resources[slot.resource.value].initialState = slot.requiredIncomingState;
     }
 
     const auto cellFor = [&](const semantic::ResourceUse& use) {
@@ -1489,15 +1540,23 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         const auto& work = *works.at(workId.value);
         const auto queue = workQueues.at(work.id.value);
 
-        std::set<std::uint32_t> waitedQueues;
+        // One wait per producer queue is sufficient, but it must reference the
+        // latest producer Work on that queue, not whichever dependency happens
+        // to appear first in the analysis record vector.
+        std::map<std::uint32_t, std::pair<std::uint32_t, pkg::SignalPointId>> queueWaits;
         for (const auto& edge : analyzed.dependencies)
         {
             if (edge.consumer != work.id) continue;
             const auto producerQueue = workQueues.at(edge.producer.value);
-            if (producerQueue != queue && waitedQueues.insert(producerQueue.value).second)
-                addOperation(pkg::D3D12OperationCode::WaitQueue, queue,
-                             pkg::Encode(pkg::WaitQueuePayload{producerQueue}));
+            if (producerQueue == queue) continue;
+            const auto producerPosition = workPosition.at(edge.producer.value);
+            auto found = queueWaits.find(producerQueue.value);
+            if (found == queueWaits.end() || producerPosition > found->second.first)
+                queueWaits[producerQueue.value] = {producerPosition, workSignalPoints.at(edge.producer.value)};
         }
+        for (const auto& [producerQueue, wait] : queueWaits)
+            addOperation(pkg::D3D12OperationCode::WaitQueue, queue,
+                         pkg::Encode(pkg::WaitQueuePayload{wait.second}));
         for (const auto& operand : work.operands)
         {
             const auto* use = uses.at(operand.use.value);
@@ -1507,7 +1566,8 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
                              pkg::Encode(pkg::WaitExternalPayload{externalSlots.at(use->resource.value)}));
             if (use->temporalRelation == semantic::TemporalRelation::Previous)
                 addOperation(pkg::D3D12OperationCode::WaitTemporal, queue,
-                             pkg::Encode(pkg::WaitTemporalPayload{resourceMap.at(use->resource.value)}));
+                             pkg::Encode(pkg::WaitTemporalPayload{resourceMap.at(use->resource.value),
+                                 workSignalPoints.at(temporalCurrentWriterWork.at(use->resource.value))}));
         }
 
         addOperation(pkg::D3D12OperationCode::BeginQueueBatch, queue);
@@ -1593,17 +1653,28 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             emitTransition(queue, viewMap.at(use->id.value), cell, desired);
         }
         addOperation(pkg::D3D12OperationCode::EndQueueBatch, queue);
-        addOperation(pkg::D3D12OperationCode::SignalQueue, queue);
+        addOperation(pkg::D3D12OperationCode::SignalQueue, queue,
+                     pkg::Encode(pkg::SignalQueuePayload{workSignalPoints.at(work.id.value)}));
     }
 
     for (const auto& slot : description.surfaceSlots)
         addOperation(pkg::D3D12OperationCode::PresentSurface, noQueue,
                      pkg::Encode(pkg::PresentSurfacePayload{slot.id}));
     if (!description.surfaceSlots.empty())
-        addOperation(pkg::D3D12OperationCode::SignalQueue, directQueue);
+        addOperation(pkg::D3D12OperationCode::SignalQueue, directQueue,
+                     pkg::Encode(pkg::SignalQueuePayload{presentSignalPoint}));
     for (const auto& slot : description.externalSlots)
+    {
+        const auto sourceResource = std::find_if(resourceMap.begin(), resourceMap.end(), [&](const auto& pair) {
+            return pair.second == slot.resource;
+        });
+        if (sourceResource == resourceMap.end())
+            return Failure<LoweredPackageStage>("external-boundary", "external Package resource has no Source resource mapping");
+        const auto lastPosition = lastExternalUse.at(sourceResource->first);
+        const auto lastWork = analyzed.canonicalWorkOrder[lastPosition];
         addOperation(pkg::D3D12OperationCode::ReleaseExternal, noQueue,
-                     pkg::Encode(pkg::ReleaseExternalPayload{slot.id}));
+                     pkg::Encode(pkg::ReleaseExternalPayload{slot.id, workSignalPoints.at(lastWork.value)}));
+    }
 
     description.operationStreams.push_back({pkg::OperationStreamKind::Load, 0, loadCount, 0});
     description.operationStreams.push_back({pkg::OperationStreamKind::Frame, loadCount,

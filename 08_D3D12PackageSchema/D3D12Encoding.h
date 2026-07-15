@@ -86,6 +86,7 @@ private:
 [[nodiscard]] std::vector<std::byte> Encode(const ExecuteRasterPayload& payload);
 [[nodiscard]] std::vector<std::byte> Encode(const ExecuteComputePayload& payload);
 [[nodiscard]] std::vector<std::byte> Encode(const CopyBufferPayload& payload);
+[[nodiscard]] std::vector<std::byte> Encode(const SignalQueuePayload& payload);
 [[nodiscard]] std::vector<std::byte> Encode(const WaitQueuePayload& payload);
 [[nodiscard]] std::vector<std::byte> Encode(const WaitTemporalPayload& payload);
 [[nodiscard]] std::vector<std::byte> Encode(const ActivateAliasPayload& payload);
@@ -109,6 +110,7 @@ private:
 [[nodiscard]] base::Result<ExecuteRasterPayload, PackageError> DecodeExecuteRaster(std::span<const std::byte> payload);
 [[nodiscard]] base::Result<ExecuteComputePayload, PackageError> DecodeExecuteCompute(std::span<const std::byte> payload);
 [[nodiscard]] base::Result<CopyBufferPayload, PackageError> DecodeCopyBuffer(std::span<const std::byte> payload);
+[[nodiscard]] base::Result<SignalQueuePayload, PackageError> DecodeSignalQueue(std::span<const std::byte> payload);
 [[nodiscard]] base::Result<WaitQueuePayload, PackageError> DecodeWaitQueue(std::span<const std::byte> payload);
 [[nodiscard]] base::Result<WaitTemporalPayload, PackageError> DecodeWaitTemporal(std::span<const std::byte> payload);
 [[nodiscard]] base::Result<ActivateAliasPayload, PackageError> DecodeActivateAlias(std::span<const std::byte> payload);

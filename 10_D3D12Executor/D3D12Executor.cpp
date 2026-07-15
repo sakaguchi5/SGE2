@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iomanip>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -47,6 +48,12 @@ runtime::RuntimeError Error(std::string stage, std::string message)
 {
     return {std::move(stage), std::move(message)};
 }
+
+struct SignalPointRuntime final
+{
+    pkg::QueueId queue;
+    std::uint64_t fenceValue = 0;
+};
 
 std::string HResultText(HRESULT hr)
 {
@@ -149,7 +156,7 @@ D3D12_RESOURCE_STATES ToNativeState(
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::DepthRead)) result |= D3D12_RESOURCE_STATE_DEPTH_READ;
     if (bits & static_cast<std::uint32_t>(pkg::ExplicitStateBits::ShaderRead))
     {
-        // Legacy v13 Package state. New v14 Packages use explicit stage scope.
+        // Legacy v13 Package state. v14+ Packages use explicit stage scope; v15 also carries explicit signal identities.
         result |= queueType == D3D12_COMMAND_LIST_TYPE_COMPUTE
             ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -244,7 +251,6 @@ public:
         externalAcquired_.resize(view_.ExternalSlots().size());
         externalWaited_.resize(view_.ExternalSlots().size());
         externalReleased_.resize(view_.ExternalSlots().size());
-        externalConsumerQueues_.assign(view_.ExternalSlots().size(), package::InvalidIndex);
         surfaceAcquired_.resize(view_.SurfaceSlots().size());
         surfacePresented_.resize(view_.SurfaceSlots().size());
         temporalWaitedResources_.resize(view_.Resources().size());
@@ -570,6 +576,7 @@ public:
         previousComputeFenceValue_ = computeLastFenceValue_;
         previousCopyFenceValue_ = copyLastFenceValue_;
         temporalDependencyFenceValue_ = 0;
+        currentFrameSignalPoints_.clear();
         frameFenceValue_ = 0;
         computeFrameFenceValue_ = 0;
         copyFrameFenceValue_ = 0;
@@ -585,7 +592,6 @@ public:
         std::fill(externalAcquired_.begin(), externalAcquired_.end(), false);
         std::fill(externalWaited_.begin(), externalWaited_.end(), false);
         std::fill(externalReleased_.begin(), externalReleased_.end(), false);
-        std::fill(externalConsumerQueues_.begin(), externalConsumerQueues_.end(), package::InvalidIndex);
         std::fill(surfaceAcquired_.begin(), surfaceAcquired_.end(), false);
         std::fill(surfacePresented_.begin(), surfacePresented_.end(), false);
         std::fill(temporalWaitedResources_.begin(), temporalWaitedResources_.end(), false);
@@ -626,6 +632,7 @@ public:
         if (computeFrameFenceValue_ != 0) submission.queues.push_back({ComputeQueueId().value, computeFrameFenceValue_});
         if (copyFrameFenceValue_ != 0) submission.queues.push_back({CopyQueueId().value, copyFrameFenceValue_});
         submission.releasedExternalResources = frameExternalReleases_;
+        previousFrameSignalPoints_ = currentFrameSignalPoints_;
         hasSubmittedFrame_ = true;
         lastSubmittedFrameNumber_ = invocation.frameNumber;
         return base::Result<runtime::FrameSubmission, runtime::RuntimeError>::Success(std::move(submission));
@@ -821,11 +828,12 @@ private:
         externalAcquired_.clear();
         externalWaited_.clear();
         externalReleased_.clear();
-        externalConsumerQueues_.clear();
         surfaceAcquired_.clear();
         surfacePresented_.clear();
         temporalWaitedResources_.clear();
         frameExternalReleases_.clear();
+        currentFrameSignalPoints_.clear();
+        previousFrameSignalPoints_.clear();
 
         commandList_.Reset();
         copyCommandList_.Reset();
@@ -1181,8 +1189,10 @@ private:
         case pkg::D3D12OperationCode::SignalQueue:
         {
             const auto loadQueue = LoadQueueId();
-            if (!loadBatchClosed_ || operation.queue != loadQueue || !operation.payload.empty() || loadQueueCompleted_)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/SignalQueue", "Package-declared load queue batch has not been closed"));
+            auto payload = pkg::DecodeSignalQueue(operation.payload);
+            if (!payload || !payload.Value().signalPoint.IsValid() ||
+                !loadBatchClosed_ || operation.queue != loadQueue || loadQueueCompleted_)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("load/SignalQueue", "Package-declared load queue batch or signal point is invalid"));
             ID3D12CommandList* lists[] = {loadCommandList_.Get()};
             NativeQueue(loadQueue)->ExecuteCommandLists(1, lists);
             const auto value = NextFenceValue(loadQueue);
@@ -1275,7 +1285,6 @@ private:
             const HRESULT hr = NativeQueue(operation.queue)->Wait(token->NativeFence(), token->Value());
             if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/wait-external", hr, device_.Get()));
             externalWaited_[slot] = true;
-            externalConsumerQueues_[slot] = operation.queue.value;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::AcquireSurfaceImage:
@@ -1404,16 +1413,19 @@ private:
         }
         case pkg::D3D12OperationCode::SignalQueue:
         {
-            if (!operation.payload.empty() || !IsSupportedQueue(operation.queue))
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "payload or Package queue is invalid"));
+            auto payload = pkg::DecodeSignalQueue(operation.payload);
+            if (!payload || !payload.Value().signalPoint.IsValid() || !IsSupportedQueue(operation.queue))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "signal point or Package queue is invalid"));
             if ((IsCopyQueue(operation.queue) && copyFrameCommandOpen_) ||
                 ((!IsCopyQueue(operation.queue)) && commandOpen_ && activeCommandQueue_ == operation.queue.value) ||
-                !FrameQueueSubmitted(operation.queue))
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "Package queue has no closed submitted batch to order"));
+                !FrameQueueSubmitted(operation.queue) ||
+                currentFrameSignalPoints_.contains(payload.Value().signalPoint.value))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/SignalQueue", "Package queue has no closed submitted batch or signal point is duplicated"));
             const auto value = NextFenceValue(operation.queue);
             const HRESULT hr = NativeQueue(operation.queue)->Signal(NativeFence(operation.queue), value);
             if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/signal-queue", hr, device_.Get()));
             SetFrameFenceValue(operation.queue, value);
+            currentFrameSignalPoints_[payload.Value().signalPoint.value] = {operation.queue, value};
             SetFrameQueueSubmitted(operation.queue, false);
             return base::Result<void, runtime::RuntimeError>::Success();
         }
@@ -1421,13 +1433,12 @@ private:
         {
             auto payload = pkg::DecodeWaitQueue(operation.payload);
             if (!payload) return PackageFailure("frame/WaitQueue", payload.Error());
-            const auto producer = payload.Value().producerQueue;
-            if (!IsSupportedQueue(operation.queue) || !IsSupportedQueue(producer) || operation.queue == producer)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitQueue", "consumer or producer Package queue is invalid"));
-            const auto value = FrameFenceValue(producer);
-            if (value == 0)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitQueue", "producer queue has not executed a preceding Package SignalQueue"));
-            const HRESULT hr = NativeQueue(operation.queue)->Wait(NativeFence(producer), value);
+            const auto signal = currentFrameSignalPoints_.find(payload.Value().signalPoint.value);
+            if (!IsSupportedQueue(operation.queue) || signal == currentFrameSignalPoints_.end() ||
+                !IsSupportedQueue(signal->second.queue) || operation.queue == signal->second.queue)
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitQueue", "consumer queue or referenced current-frame signal point is invalid"));
+            const HRESULT hr = NativeQueue(operation.queue)->Wait(
+                NativeFence(signal->second.queue), signal->second.fenceValue);
             if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/wait-queue", hr, device_.Get()));
             return base::Result<void, runtime::RuntimeError>::Success();
         }
@@ -1437,16 +1448,21 @@ private:
             if (!payload) return PackageFailure("frame/WaitTemporal", payload.Error());
             const auto resource = payload.Value().resource;
             if (!IsSupportedQueue(operation.queue) || !resource.IsValid() || resource.value >= view_.Resources().size() ||
-                !IsTemporal(view_.Resources()[resource.value]) || temporalWaitedResources_[resource.value])
+                !IsTemporal(view_.Resources()[resource.value]))
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitTemporal", "Package queue or Temporal resource contract is invalid"));
-            const auto dependency = PreviousFrameFenceValue(operation.queue);
-            if (dependency != 0)
+            std::uint64_t dependency = 0;
+            if (hasSubmittedFrame_)
             {
-                const HRESULT hr = NativeQueue(operation.queue)->Wait(NativeFence(operation.queue), dependency);
+                const auto signal = previousFrameSignalPoints_.find(payload.Value().producerSignalPoint.value);
+                if (signal == previousFrameSignalPoints_.end() || !IsSupportedQueue(signal->second.queue))
+                    return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitTemporal", "previous-frame producer signal point is unavailable"));
+                dependency = signal->second.fenceValue;
+                const HRESULT hr = NativeQueue(operation.queue)->Wait(
+                    NativeFence(signal->second.queue), dependency);
                 if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/wait-temporal", hr, device_.Get()));
             }
             temporalWaitedResources_[resource.value] = true;
-            temporalDependencyFenceValue_ = dependency;
+            temporalDependencyFenceValue_ = std::max(temporalDependencyFenceValue_, dependency);
             return base::Result<void, runtime::RuntimeError>::Success();
         }
         case pkg::D3D12OperationCode::ReleaseExternal:
@@ -1456,14 +1472,14 @@ private:
             const auto slot = payload.Value().slot.value;
             if (!payload.Value().slot.IsValid() || slot >= view_.ExternalSlots().size() || !externalWaited_[slot] || externalReleased_[slot])
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ReleaseExternal", "external release order or slot is invalid"));
-            const auto queueId = pkg::QueueId{externalConsumerQueues_[slot]};
-            const auto fenceValue = FrameFenceValue(queueId);
-            if (!IsSupportedQueue(queueId) || fenceValue == 0)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ReleaseExternal", "external consumer queue has not been signaled"));
+            const auto signal = currentFrameSignalPoints_.find(payload.Value().releaseSignalPoint.value);
+            if (signal == currentFrameSignalPoints_.end() || !IsSupportedQueue(signal->second.queue))
+                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ReleaseExternal", "Package release signal point is unavailable"));
             const auto& contract = view_.ExternalSlots()[slot];
             if (!(TrackedState(contract.resource) == contract.guaranteedOutgoingState))
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ReleaseExternal", "external outgoing state does not match the package contract"));
-            frameExternalReleases_.push_back({slot, std::make_shared<CompletionToken>(FenceReference(queueId), fenceValue, deviceEpoch_)});
+            frameExternalReleases_.push_back({slot, std::make_shared<CompletionToken>(
+                FenceReference(signal->second.queue), signal->second.fenceValue, deviceEpoch_)});
             externalReleased_[slot] = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
@@ -2658,11 +2674,12 @@ private:
     std::vector<bool> externalAcquired_;
     std::vector<bool> externalWaited_;
     std::vector<bool> externalReleased_;
-    std::vector<std::uint32_t> externalConsumerQueues_;
     std::vector<bool> surfaceAcquired_;
     std::vector<bool> surfacePresented_;
     std::vector<bool> temporalWaitedResources_;
     std::vector<runtime::ExternalRelease> frameExternalReleases_;
+    std::map<std::uint32_t, SignalPointRuntime> currentFrameSignalPoints_;
+    std::map<std::uint32_t, SignalPointRuntime> previousFrameSignalPoints_;
     std::vector<std::vector<ComPtr<ID3D12Heap>>> placedHeaps_;
     std::vector<std::uint32_t> activeAliasResources_;
     std::vector<ComPtr<ID3D12Resource>> uploadResources_;
