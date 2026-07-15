@@ -172,6 +172,30 @@ base::Result<ResourceId, std::string> SemanticBuilder::AddTemporalGpuWrittenBuff
     return base::Result<ResourceId, std::string>::Success(id);
 }
 
+base::Result<ResourceId, std::string> SemanticBuilder::AddPersistentGpuWrittenBuffer(
+    std::string debugName,
+    std::uint64_t sizeBytes,
+    std::uint32_t strideBytes)
+{
+    if (sizeBytes == 0 || strideBytes == 0 || sizeBytes % strideBytes != 0)
+        return base::Result<ResourceId, std::string>::Failure("persistent GPU-written buffer size must be positive and divisible by stride");
+    if (sizeBytes > std::numeric_limits<std::uint32_t>::max())
+        return base::Result<ResourceId, std::string>::Failure("persistent GPU-written buffer is too large for Level-1 qualification");
+
+    const auto id = NextId<ResourceId>(graph_.resources.size());
+    Resource resource;
+    resource.id = id;
+    resource.debugName = std::move(debugName);
+    resource.kind = ResourceKind::Buffer;
+    resource.lifetime = LifetimeIntent::Persistent;
+    resource.update = UpdateIntent::GpuWritten;
+    resource.visibility = Visibility::Internal;
+    resource.buffer.sizeBytes = sizeBytes;
+    resource.buffer.strideBytes = strideBytes;
+    graph_.resources.push_back(std::move(resource));
+    return base::Result<ResourceId, std::string>::Success(id);
+}
+
 base::Result<ResourceId, std::string> SemanticBuilder::AddGpuWrittenBuffer(
     std::string debugName,
     std::uint64_t sizeBytes,

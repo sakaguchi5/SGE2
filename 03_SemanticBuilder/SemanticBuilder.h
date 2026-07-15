@@ -43,6 +43,11 @@ public:
         std::uint32_t strideBytes,
         std::span<const std::byte> initialContent);
 
+    [[nodiscard]] base::Result<ResourceId, std::string> AddPersistentGpuWrittenBuffer(
+        std::string debugName,
+        std::uint64_t sizeBytes,
+        std::uint32_t strideBytes);
+
     [[nodiscard]] base::Result<ResourceId, std::string> AddGpuWrittenBuffer(
         std::string debugName,
         std::uint64_t sizeBytes,
