@@ -1,0 +1,13 @@
+Overlay this ZIP at the root of repository commit:
+c42b0a5d198ec8ad05daa3754dc98d7418b88465
+
+Added paths only:
+  47_Level3AuthorityTests/47_Level3AuthorityTests.vcxproj
+  47_Level3AuthorityTests/main.cpp
+  47_Level3AuthorityTests/README.md
+  run_level3_decisive_tests.bat
+
+No existing source file, solution file, ABI, Schema, Runtime, or current final script is replaced.
+The project builds directly through ProjectReference, so adding it to SemanticGpuEngine2.sln is not required yet.
+
+V2: overwrite the previous 47_Level3AuthorityTests.vcxproj and run_level3_decisive_tests.bat.
