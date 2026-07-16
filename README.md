@@ -1,6 +1,14 @@
-# Semantic GPU Engine 2 — G1-G7 Generic Compiler
+# Semantic GPU Engine 2 — Level 2 Complete
 
-The compiler path has been generalized through G1-G7. See [docs/GENERALIZATION_G1_G7.md](docs/GENERALIZATION_G1_G7.md) for the implemented contracts and the explicit boundary before Level 2 Qualification.
+Semantic GPU Engine 2 Level 2 is frozen at D3D12 target schema 17 and minimum Runtime 17. The Compiler accepts the declared finite semantic vocabulary with unfixed resource/Work cardinality and finite-DAG shape, freezes every execution decision into a source-independent Package, and rejects unsupported or malformed inputs before D3D12 materialization.
+
+The authoritative completion command is:
+
+```powershell
+.\run_level2_final.bat
+```
+
+It runs the complete suite in Debug and Release, verifies architectural dependency boundaries, recompiles the fixed 54-Package corpus in same and fresh processes, and requires the Debug/Release freeze manifests to be byte-identical. See [the final capability constitution](docs/LEVEL2_CAPABILITY_CONSTITUTION_FINAL.md), [qualification corpus](docs/LEVEL2_QUALIFICATION_CORPUS.md), and [Stage M procedure](docs/LEVEL2_STAGE_M.md).
 
 The Slice 15 experiment below remains the retained Level 1 reference input and cross-frontend equivalence proof.
 
@@ -73,6 +81,7 @@ The Slice 13 lifecycle corrections remain included: process-once Debug Layer/DRE
 .\run_demo.bat Debug --warp
 .\run_demo.bat Debug --warp --force-removal
 .\verify_dependencies.ps1
+.\run_level2_final.bat
 ```
 
 `41_PackageCompiler` accepts a frontend selector:
@@ -86,7 +95,9 @@ The Slice 13 lifecycle corrections remain included: process-once Debug Layer/DRE
 
 The default is `all`. The old Slice-14 spelling `both` is retained as an alias for `all`. In equivalence mode the compiler refuses to write a Package unless all three frontends agree on geometry, execution digest, and every Package byte.
 
-Expected final lines include:
+The standard test command retains the earlier output below. The final-freeze command ends with `SGE2 LEVEL 2 FINAL FREEZE PASSED` and `Semantic GPU Engine 2 Level 2 is complete.`
+
+Expected retained lines include:
 
 ```text
 PGA join, meet, incidence, finite normalization, and ideal-point rejection passed.

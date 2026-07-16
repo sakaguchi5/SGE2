@@ -47,7 +47,7 @@ $forbidden = @(
     '22_PgaFrontend',
     '23_ExperimentDomain'
 )
-$targets = @('10_D3D12Executor', '35_D3D12ReadbackTests', '40_Launcher')
+$targets = @('09_PackageRuntime', '10_D3D12Executor', '35_D3D12ReadbackTests', '40_Launcher')
 
 foreach ($targetName in $targets) {
     $targetProject = $projectFiles | Where-Object { $_.Directory.Name -eq $targetName } | Select-Object -First 1
@@ -108,5 +108,35 @@ foreach ($frontendName in $frontendIsolation.Keys) {
         }
     }
 }
+
+
+
+function Assert-NoForbiddenDependency([string]$targetName, [string[]]$forbiddenNames) {
+    $targetProject = $projectFiles | Where-Object { $_.Directory.Name -eq $targetName } | Select-Object -First 1
+    if (-not $targetProject) { throw "Layer-boundary target project was not found: $targetName" }
+    $dependencies = Get-TransitiveDependencies $targetProject.FullName
+    foreach ($dependency in $dependencies.Keys) {
+        $dependencyName = Split-Path (Split-Path $dependency -Parent) -Leaf
+        if ($forbiddenNames -contains $dependencyName) {
+            throw "$targetName transitively references forbidden project $dependencyName"
+        }
+    }
+}
+
+$sourceSide = @(
+    '02_SemanticModel', '03_SemanticBuilder', '04_SemanticAnalysis', '05_TargetModel',
+    '06_D3D12TargetCompiler', '20_ClassicalFrontend', '21_SdfFrontend',
+    '22_PgaFrontend', '23_ExperimentDomain', '24_Level1Scenarios',
+    '25_Level2Scenarios', '26_Level2GeneratedGraphs', '27_Level2RuntimeScenarios'
+)
+$runtimeSide = @('09_PackageRuntime', '10_D3D12Executor', '11_PlatformWin32')
+
+Assert-NoForbiddenDependency '07_FrozenPackageCore' ($sourceSide + $runtimeSide)
+Assert-NoForbiddenDependency '08_D3D12PackageSchema' ($sourceSide + $runtimeSide)
+Assert-NoForbiddenDependency '06_D3D12TargetCompiler' $runtimeSide
+Assert-NoForbiddenDependency '09_PackageRuntime' $sourceSide
+Assert-NoForbiddenDependency '10_D3D12Executor' $sourceSide
+Assert-NoForbiddenDependency '35_D3D12ReadbackTests' $sourceSide
+Assert-NoForbiddenDependency '40_Launcher' $sourceSide
 
 Write-Host "Dependency boundary check passed. Projects: $($projectFiles.Count), references: $((($graph.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum)."

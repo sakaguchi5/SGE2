@@ -66,6 +66,8 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "42_Level2RuntimeSemanticTes
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "43_Level2AdversarialBoundaryTests", "43_Level2AdversarialBoundaryTests\43_Level2AdversarialBoundaryTests.vcxproj", "{43A1B2C3-D4E5-4F67-89A0-B1C2D3E4F506}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "44_Level2FinalFreezeTests", "44_Level2FinalFreezeTests\44_Level2FinalFreezeTests.vcxproj", "{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}"
+EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "40_Launcher", "40_Launcher\40_Launcher.vcxproj", "{ADA94B9E-8FBE-5406-A7A8-4EE888BDCA5E}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "41_PackageCompiler", "41_PackageCompiler\41_PackageCompiler.vcxproj", "{63825FD2-9A95-58AD-B4D5-BF5249EB5E1A}"
@@ -212,6 +214,10 @@ Global
 		{43A1B2C3-D4E5-4F67-89A0-B1C2D3E4F506}.Debug|x64.Build.0 = Debug|x64
 		{43A1B2C3-D4E5-4F67-89A0-B1C2D3E4F506}.Release|x64.ActiveCfg = Release|x64
 		{43A1B2C3-D4E5-4F67-89A0-B1C2D3E4F506}.Release|x64.Build.0 = Release|x64
+		{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}.Debug|x64.ActiveCfg = Debug|x64
+		{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}.Debug|x64.Build.0 = Debug|x64
+		{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}.Release|x64.ActiveCfg = Release|x64
+		{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

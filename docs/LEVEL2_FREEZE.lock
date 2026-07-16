@@ -1,0 +1,7 @@
+identity=SGE2-Level2-D3D12-v1-FinalFreeze-Corpus1
+baseline-commit=fc6b883b20d5428a4bf4f82b072fab15e8cb844a
+target-schema=17
+minimum-runtime=17
+accepted-corpus-count=54
+semantic-corpus-digest=4b07e0725dc87f30f495794ea2ef5e245dd0d6415397761c441a9a1ca4f83c49
+authoritative-command=run_level2_final.bat

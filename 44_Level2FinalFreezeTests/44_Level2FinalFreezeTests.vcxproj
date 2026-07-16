@@ -1,0 +1,55 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion><Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{44B2C3D4-E5F6-4789-8A01-B2C3D4E5F607}</ProjectGuid>
+    <RootNamespace>44_Level2FinalFreezeTests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries><PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v145</PlatformToolset><WholeProgramOptimization>true</WholeProgramOptimization><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" /><ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup><OutDir>$(SolutionDir)build\bin\$(Platform)\$(Configuration)\</OutDir><IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir><TargetName>$(ProjectName)</TargetName></PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpplatest</LanguageStandard><MultiProcessorCompilation>true</MultiProcessorCompilation><PreprocessorDefinitions>WIN32;_WINDOWS;_DEBUG;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary><TreatWarningAsError>false</TreatWarningAsError><AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>d3dcompiler.lib;d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpplatest</LanguageStandard><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><MultiProcessorCompilation>true</MultiProcessorCompilation><PreprocessorDefinitions>WIN32;_WINDOWS;NDEBUG;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><TreatWarningAsError>false</TreatWarningAsError><AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <Link><SubSystem>Console</SubSystem><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>d3dcompiler.lib;d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="main.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\00_Base\00_Base.vcxproj"><Project>{E91746D8-5978-5680-B802-1D9C7D18E81A}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\02_SemanticModel\02_SemanticModel.vcxproj"><Project>{ACC10621-B9BD-5750-AB25-196639380352}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\03_SemanticBuilder\03_SemanticBuilder.vcxproj"><Project>{B6DC54DB-CB75-5305-A340-E21C7F9B159E}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\04_SemanticAnalysis\04_SemanticAnalysis.vcxproj"><Project>{D61CDCD4-61D5-5013-88C4-990D4C745AA0}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\05_TargetModel\05_TargetModel.vcxproj"><Project>{5FDDCE6E-90DA-58BB-AF22-EBC7F2004C1B}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\06_D3D12TargetCompiler\06_D3D12TargetCompiler.vcxproj"><Project>{9511A921-B93D-5A45-B7C5-008C5A172279}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\07_FrozenPackageCore\07_FrozenPackageCore.vcxproj"><Project>{D2EC95AE-09B0-50FC-A76F-E38B30F2802A}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\08_D3D12PackageSchema\08_D3D12PackageSchema.vcxproj"><Project>{6BD85765-9971-5AAD-95B9-094A4BE4F739}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\24_Level1Scenarios\24_Level1Scenarios.vcxproj"><Project>{C8B5E0C8-5C1B-4D4A-9C82-4E9E53E8A124}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\25_Level2Scenarios\25_Level2Scenarios.vcxproj"><Project>{58C1861F-C41B-499A-8C30-961A14A38F8B}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\26_Level2GeneratedGraphs\26_Level2GeneratedGraphs.vcxproj"><Project>{6C2A54F0-7E4B-4E88-9F41-2F6AD7C9B120}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+    <ProjectReference Include="..\27_Level2RuntimeScenarios\27_Level2RuntimeScenarios.vcxproj"><Project>{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}</Project><ReferenceOutputAssembly>false</ReferenceOutputAssembly></ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>
