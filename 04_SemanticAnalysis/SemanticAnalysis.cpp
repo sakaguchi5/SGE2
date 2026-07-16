@@ -323,8 +323,9 @@ void ValidateResourceUse(const ResourceUse& use, const Resource& resource,
             Push(diagnostics, "ShaderBuffer requires a read-only Buffer", source);
         break;
     case ViewRole::StorageBuffer:
-        if (resource.kind != ResourceKind::Buffer || !write || resource.update != UpdateIntent::GpuWritten)
-            Push(diagnostics, "StorageBuffer requires a GPU-written Buffer with write effect", source);
+        if (resource.kind != ResourceKind::Buffer || !write ||
+            (resource.update != UpdateIntent::GpuWritten && resource.update != UpdateIntent::External))
+            Push(diagnostics, "StorageBuffer requires a GPU-written or External Buffer with write effect", source);
         break;
     case ViewRole::ColorAttachment:
         if (resource.kind != ResourceKind::SurfaceImage || !write)
@@ -354,8 +355,10 @@ void ValidateResourceUse(const ResourceUse& use, const Resource& resource,
 
     if (use.temporalRelation == TemporalRelation::Previous)
     {
-        if (resource.lifetime != LifetimeIntent::Temporal || use.role != ViewRole::ShaderBuffer || !read || write)
-            Push(diagnostics, "Previous temporal relation requires a read-only ShaderBuffer use of a Temporal resource", source);
+        const bool previousReadableRole = use.role == ViewRole::ShaderBuffer ||
+                                          use.role == ViewRole::CopySource;
+        if (resource.lifetime != LifetimeIntent::Temporal || !previousReadableRole || !read || write)
+            Push(diagnostics, "Previous temporal relation requires a read-only ShaderBuffer or CopySource use of a Temporal resource", source);
     }
     else if (use.temporalRelation != TemporalRelation::Current)
     {

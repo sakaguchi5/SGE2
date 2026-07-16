@@ -216,29 +216,55 @@ const char* SemanticName(pkg::VertexMeaning meaning)
 class ExternalBufferResource final : public runtime::IExternalResource
 {
 public:
-    ExternalBufferResource(ComPtr<ID3D12Resource> resource, std::uint64_t epoch, std::uint64_t bytes)
-        : resource_(std::move(resource)), epoch_(epoch), bytes_(bytes) {}
+    ExternalBufferResource(ComPtr<ID3D12Resource> resource,
+                           const void* owner,
+                           std::uint64_t epoch,
+                           std::uint64_t bytes,
+                           std::uint32_t slot,
+                           pkg::ResourceState incoming,
+                           pkg::ResourceState outgoing)
+        : resource_(std::move(resource)), owner_(owner), epoch_(epoch), bytes_(bytes),
+          slot_(slot), incoming_(incoming), outgoing_(outgoing), current_(incoming) {}
     [[nodiscard]] std::uint64_t DeviceEpoch() const noexcept override { return epoch_; }
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept override { return bytes_; }
     [[nodiscard]] ID3D12Resource* Native() const noexcept { return resource_.Get(); }
+    [[nodiscard]] const void* Owner() const noexcept { return owner_; }
+    [[nodiscard]] std::uint32_t Slot() const noexcept { return slot_; }
+    [[nodiscard]] pkg::ResourceState IncomingState() const noexcept { return incoming_; }
+    [[nodiscard]] pkg::ResourceState OutgoingState() const noexcept { return outgoing_; }
+    [[nodiscard]] pkg::ResourceState CurrentState() const noexcept { return current_; }
+    void SetCurrentState(pkg::ResourceState state) noexcept { current_ = state; }
 private:
     ComPtr<ID3D12Resource> resource_;
+    const void* owner_ = nullptr;
     std::uint64_t epoch_ = 0;
     std::uint64_t bytes_ = 0;
+    std::uint32_t slot_ = package::InvalidIndex;
+    pkg::ResourceState incoming_{};
+    pkg::ResourceState outgoing_{};
+    pkg::ResourceState current_{};
 };
 
 class CompletionToken final : public runtime::ICompletionToken
 {
 public:
-    CompletionToken(ComPtr<ID3D12Fence> fence, std::uint64_t value, std::uint64_t epoch)
-        : fence_(std::move(fence)), value_(value), epoch_(epoch) {}
+    CompletionToken(ComPtr<ID3D12Fence> fence,
+                    std::uint64_t value,
+                    std::uint64_t epoch,
+                    const void* owner,
+                    std::uint32_t slot)
+        : fence_(std::move(fence)), value_(value), epoch_(epoch), owner_(owner), slot_(slot) {}
     [[nodiscard]] std::uint64_t DeviceEpoch() const noexcept override { return epoch_; }
     [[nodiscard]] std::uint64_t Value() const noexcept override { return value_; }
     [[nodiscard]] ID3D12Fence* NativeFence() const noexcept { return fence_.Get(); }
+    [[nodiscard]] const void* Owner() const noexcept { return owner_; }
+    [[nodiscard]] std::uint32_t Slot() const noexcept { return slot_; }
 private:
     ComPtr<ID3D12Fence> fence_;
     std::uint64_t value_ = 0;
     std::uint64_t epoch_ = 0;
+    const void* owner_ = nullptr;
+    std::uint32_t slot_ = package::InvalidIndex;
 };
 
 class Instance final : public runtime::IPackageInstance
@@ -312,19 +338,46 @@ public:
         return base::Result<void, runtime::RuntimeError>::Success();
     }
 
-    base::Result<ExternalBufferBinding, runtime::RuntimeError> CreateExternalColorBuffer(const std::array<float, 4>& color)
+    base::Result<ExternalBufferBinding, runtime::RuntimeError> CreateExternalBuffer(
+        std::uint32_t slot,
+        std::span<const std::byte> initialBytes)
     {
         if (runtimeState_ != runtime::DeviceRuntimeState::Active || !device_)
             return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
                 Error("external/device-state", "External resources can be created only while the Package instance is Active"));
+        if (slot >= view_.ExternalSlots().size())
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/slot", "external resource creation references an unknown Package slot"));
+        const auto& contract = view_.ExternalSlots()[slot];
+        if (!contract.resource.IsValid() || contract.resource.value >= view_.Resources().size())
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/slot", "external slot has an invalid Package resource"));
+        const auto& artifact = view_.Resources()[contract.resource.value];
+        if (artifact.resourceKind != pkg::ResourceKind::Buffer || contract.minimumBytes == 0 ||
+            initialBytes.size() > contract.minimumBytes)
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/shape", "external Buffer initialization exceeds or contradicts the slot contract"));
+
+        const auto incomingState = ToNativeState(contract.requiredIncomingState, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        bool requiresUnorderedAccess = false;
+        const std::uint64_t viewEnd = static_cast<std::uint64_t>(artifact.firstView) + artifact.viewCount;
+        if (viewEnd > view_.Views().size())
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/views", "external Buffer view range is invalid"));
+        for (std::uint32_t index = artifact.firstView; index < viewEnd; ++index)
+            if (view_.Views()[index].viewClass == pkg::ViewClass::UnorderedAccess)
+                requiresUnorderedAccess = true;
+
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = sizeof(color);
+        desc.Width = contract.minimumBytes;
         desc.Height = 1;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = requiresUnorderedAccess ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                             : D3D12_RESOURCE_FLAG_NONE;
 
         D3D12_HEAP_PROPERTIES defaultHeap{};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -333,71 +386,234 @@ public:
         ComPtr<ID3D12Resource> resource;
         HRESULT hr = device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource));
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/create-buffer", hr, device_.Get()));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/create-buffer", hr, device_.Get()));
 
         D3D12_HEAP_PROPERTIES uploadHeap{};
         uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
         uploadHeap.CreationNodeMask = 1;
         uploadHeap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC uploadDesc = desc;
+        uploadDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
         ComPtr<ID3D12Resource> upload;
-        hr = device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc,
+        hr = device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload));
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/create-upload", hr, device_.Get()));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/create-upload", hr, device_.Get()));
         void* mapped = nullptr;
         D3D12_RANGE noRead{0, 0};
         hr = upload->Map(0, &noRead, &mapped);
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/map-upload", hr, device_.Get()));
-        std::memcpy(mapped, color.data(), sizeof(color));
-        D3D12_RANGE written{0, sizeof(color)};
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/map-upload", hr, device_.Get()));
+        std::memset(mapped, 0, static_cast<std::size_t>(contract.minimumBytes));
+        if (!initialBytes.empty())
+            std::memcpy(mapped, initialBytes.data(), initialBytes.size());
+        D3D12_RANGE written{0, static_cast<SIZE_T>(contract.minimumBytes)};
         upload->Unmap(0, &written);
 
         ComPtr<ID3D12CommandAllocator> producerAllocator;
         ComPtr<ID3D12GraphicsCommandList> producerList;
         hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&producerAllocator));
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/create-allocator", hr, device_.Get()));
-        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, producerAllocator.Get(), nullptr, IID_PPV_ARGS(&producerList));
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/create-command-list", hr, device_.Get()));
-        const auto toCopyDestination = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        producerList->ResourceBarrier(1, &toCopyDestination);
-        producerList->CopyBufferRegion(resource.Get(), 0, upload.Get(), 0, sizeof(color));
-        const auto incomingState = view_.ExternalSlots().empty()
-            ? pkg::ResourceState{pkg::StateClass::Explicit, 0,
-                static_cast<std::uint32_t>(pkg::ExplicitStateBits::PixelShaderRead)}
-            : view_.ExternalSlots().front().requiredIncomingState;
-        const auto shaderRead = ToNativeState(incomingState, D3D12_COMMAND_LIST_TYPE_DIRECT);
-        if (shaderRead == static_cast<D3D12_RESOURCE_STATES>(0))
+        if (FAILED(hr))
             return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
-                Error("external/incoming-state", "external slot has no executable shader-read state"));
-        const auto toShaderRead = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, shaderRead);
-        producerList->ResourceBarrier(1, &toShaderRead);
+                HResultError("external/create-allocator", hr, device_.Get()));
+        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, producerAllocator.Get(), nullptr,
+            IID_PPV_ARGS(&producerList));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/create-command-list", hr, device_.Get()));
+        const auto toCopyDestination = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                                                          D3D12_RESOURCE_STATE_COPY_DEST);
+        producerList->ResourceBarrier(1, &toCopyDestination);
+        producerList->CopyBufferRegion(resource.Get(), 0, upload.Get(), 0, contract.minimumBytes);
+        if (incomingState != D3D12_RESOURCE_STATE_COPY_DEST)
+        {
+            const auto toIncoming = TransitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, incomingState);
+            producerList->ResourceBarrier(1, &toIncoming);
+        }
         hr = producerList->Close();
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/close-command-list", hr, device_.Get()));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/close-command-list", hr, device_.Get()));
         ID3D12CommandList* lists[] = {producerList.Get()};
         NativeQueue(DirectQueueId())->ExecuteCommandLists(1, lists);
 
         ComPtr<ID3D12Fence> producerFence;
         hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&producerFence));
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/create-producer-fence", hr, device_.Get()));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/create-producer-fence", hr, device_.Get()));
         hr = NativeQueue(DirectQueueId())->Signal(producerFence.Get(), 1);
-        if (FAILED(hr)) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/signal-producer", hr, device_.Get()));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                HResultError("external/signal-producer", hr, device_.Get()));
         HANDLE producerEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!producerEvent) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(Error("external/create-event", "CreateEventW failed"));
+        if (!producerEvent)
+            return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                Error("external/create-event", "CreateEventW failed"));
         if (producerFence->GetCompletedValue() < 1)
         {
             hr = producerFence->SetEventOnCompletion(1, producerEvent);
             if (FAILED(hr))
             {
                 CloseHandle(producerEvent);
-                return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(HResultError("external/set-producer-event", hr, device_.Get()));
+                return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+                    HResultError("external/set-producer-event", hr, device_.Get()));
             }
             WaitForSingleObject(producerEvent, INFINITE);
         }
         CloseHandle(producerEvent);
 
+        TrackedState(contract.resource) = contract.requiredIncomingState;
         ExternalBufferBinding result;
-        result.resource = std::make_shared<ExternalBufferResource>(resource, deviceEpoch_, sizeof(color));
-        result.availableAfter = std::make_shared<CompletionToken>(producerFence, 1, deviceEpoch_);
+        result.resource = std::make_shared<ExternalBufferResource>(resource, this, deviceEpoch_,
+            contract.minimumBytes, slot, contract.requiredIncomingState, contract.guaranteedOutgoingState);
+        result.availableAfter = std::make_shared<CompletionToken>(producerFence, 1, deviceEpoch_, this, slot);
         return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Success(std::move(result));
+    }
+
+    base::Result<ExternalBufferReadback, runtime::RuntimeError> ReadExternalBuffer(
+        const std::shared_ptr<runtime::IExternalResource>& resource,
+        const std::shared_ptr<runtime::ICompletionToken>& safeAfter)
+    {
+        if (runtimeState_ != runtime::DeviceRuntimeState::Active || !device_)
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-device-state", "external readback requires an Active Package instance"));
+        auto* native = dynamic_cast<ExternalBufferResource*>(resource.get());
+        auto* token = dynamic_cast<CompletionToken*>(safeAfter.get());
+        if (!native || !token || native->Owner() != this || token->Owner() != this ||
+            native->DeviceEpoch() != deviceEpoch_ || token->DeviceEpoch() != deviceEpoch_ ||
+            token->Slot() != native->Slot())
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-owner", "external readback resource or token belongs to another instance or epoch"));
+        if (native->Slot() >= view_.ExternalSlots().size())
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-slot", "external readback resource has no Package slot"));
+        const auto& contract = view_.ExternalSlots()[native->Slot()];
+        if (native->CurrentState() != contract.guaranteedOutgoingState)
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-state", "external resource has not reached the Package outgoing state"));
+
+        HANDLE sourceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!sourceEvent)
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-event", "CreateEventW failed"));
+        HRESULT hr = S_OK;
+        if (token->NativeFence()->GetCompletedValue() < token->Value())
+        {
+            hr = token->NativeFence()->SetEventOnCompletion(token->Value(), sourceEvent);
+            if (FAILED(hr))
+            {
+                CloseHandle(sourceEvent);
+                return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                    HResultError("external/readback-set-source-event", hr, device_.Get()));
+            }
+            WaitForSingleObject(sourceEvent, INFINITE);
+        }
+        CloseHandle(sourceEvent);
+
+        D3D12_RESOURCE_DESC readbackDesc{};
+        readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readbackDesc.Width = native->SizeBytes();
+        readbackDesc.Height = 1;
+        readbackDesc.DepthOrArraySize = 1;
+        readbackDesc.MipLevels = 1;
+        readbackDesc.SampleDesc.Count = 1;
+        readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES readbackHeap{};
+        readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+        readbackHeap.CreationNodeMask = 1;
+        readbackHeap.VisibleNodeMask = 1;
+        ComPtr<ID3D12Resource> readback;
+        hr = device_->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-create-buffer", hr, device_.Get()));
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-create-allocator", hr, device_.Get()));
+        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(&list));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-create-command-list", hr, device_.Get()));
+
+        const auto outgoingState = ToNativeState(contract.guaranteedOutgoingState, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        const auto incomingState = ToNativeState(contract.requiredIncomingState, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        if (outgoingState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+        {
+            const auto toSource = TransitionBarrier(native->Native(), outgoingState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &toSource);
+        }
+        list->CopyBufferRegion(readback.Get(), 0, native->Native(), 0, native->SizeBytes());
+        if (incomingState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+        {
+            const auto toIncoming = TransitionBarrier(native->Native(), D3D12_RESOURCE_STATE_COPY_SOURCE, incomingState);
+            list->ResourceBarrier(1, &toIncoming);
+        }
+        hr = list->Close();
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-close-command-list", hr, device_.Get()));
+        ID3D12CommandList* lists[] = {list.Get()};
+        NativeQueue(DirectQueueId())->ExecuteCommandLists(1, lists);
+
+        ComPtr<ID3D12Fence> readbackFence;
+        hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&readbackFence));
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-create-fence", hr, device_.Get()));
+        hr = NativeQueue(DirectQueueId())->Signal(readbackFence.Get(), 1);
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-signal", hr, device_.Get()));
+        HANDLE readbackEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!readbackEvent)
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                Error("external/readback-create-event", "CreateEventW failed"));
+        if (readbackFence->GetCompletedValue() < 1)
+        {
+            hr = readbackFence->SetEventOnCompletion(1, readbackEvent);
+            if (FAILED(hr))
+            {
+                CloseHandle(readbackEvent);
+                return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                    HResultError("external/readback-set-event", hr, device_.Get()));
+            }
+            WaitForSingleObject(readbackEvent, INFINITE);
+        }
+        CloseHandle(readbackEvent);
+
+        ExternalBufferReadback result;
+        result.bytes.resize(static_cast<std::size_t>(native->SizeBytes()));
+        void* mapped = nullptr;
+        D3D12_RANGE readRange{0, static_cast<SIZE_T>(native->SizeBytes())};
+        hr = readback->Map(0, &readRange, &mapped);
+        if (FAILED(hr))
+            return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+                HResultError("external/readback-map", hr, device_.Get()));
+        std::memcpy(result.bytes.data(), mapped, result.bytes.size());
+        D3D12_RANGE noWrite{0, 0};
+        readback->Unmap(0, &noWrite);
+
+        native->SetCurrentState(contract.requiredIncomingState);
+        TrackedState(contract.resource) = contract.requiredIncomingState;
+        result.availableAfter = std::make_shared<CompletionToken>(readbackFence, 1, deviceEpoch_, this, native->Slot());
+        return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Success(std::move(result));
+    }
+
+    base::Result<ExternalBufferBinding, runtime::RuntimeError> CreateExternalColorBuffer(
+        const std::array<float, 4>& color)
+    {
+        return CreateExternalBuffer(0, std::as_bytes(std::span<const float>(color)));
     }
 
     base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError> RecoverDevice(runtime::DeviceRecoveryMode mode)
@@ -794,8 +1010,15 @@ private:
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("invocation", "external binding belongs to a different device epoch"));
             if (binding.resource->SizeBytes() < contract.minimumBytes)
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("invocation", "external resource is smaller than the slot contract"));
-            if (!dynamic_cast<ExternalBufferResource*>(binding.resource.get()) || !dynamic_cast<CompletionToken*>(binding.availableAfter.get()))
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("invocation", "external binding was not created by this D3D12 executor"));
+            auto* nativeResource = dynamic_cast<ExternalBufferResource*>(binding.resource.get());
+            auto* nativeToken = dynamic_cast<CompletionToken*>(binding.availableAfter.get());
+            if (!nativeResource || !nativeToken || nativeResource->Owner() != this || nativeToken->Owner() != this ||
+                nativeToken->Slot() != binding.slot)
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("invocation", "external resource/token was not created for this Package instance and slot"));
+            if (nativeResource->Slot() != binding.slot)
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("invocation", "external resource was created for a different Package slot"));
             externalBindings_[binding.slot] = binding;
         }
         for (const auto& binding : externalBindings_)
@@ -1223,28 +1446,60 @@ private:
             if (!payload) return PackageFailure("frame/AcquireExternal", payload.Error());
             const auto slot = payload.Value().slot.value;
             if (!payload.Value().slot.IsValid() || slot >= view_.ExternalSlots().size() || externalAcquired_[slot])
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/AcquireExternal", "external slot is invalid or already acquired"));
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/AcquireExternal", "external slot is invalid or already acquired"));
             const auto& contract = view_.ExternalSlots()[slot];
             auto* native = dynamic_cast<ExternalBufferResource*>(externalBindings_[slot].resource.get());
-            if (!native || !contract.resource.IsValid() || contract.resource.value >= externalNativeResources_.size())
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/AcquireExternal", "external resource implementation or package resource is invalid"));
-            if (!(TrackedState(contract.resource) == contract.requiredIncomingState))
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/AcquireExternal", "external resource incoming state does not match the package contract"));
-            const auto* externalView = FindShaderResourceView(contract.resource);
-            if (!externalView || externalView->strideBytes == 0 || externalView->byteSize == 0 ||
-                externalView->byteOffset % externalView->strideBytes != 0 || externalView->byteSize % externalView->strideBytes != 0)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/AcquireExternal", "Package does not provide a valid ShaderResource view for the external buffer"));
+            if (!native || native->Owner() != this || native->Slot() != slot ||
+                !contract.resource.IsValid() || contract.resource.value >= externalNativeResources_.size())
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/AcquireExternal", "external resource implementation, ownership, slot, or Package resource is invalid"));
+            if (native->CurrentState() != contract.requiredIncomingState ||
+                !(TrackedState(contract.resource) == contract.requiredIncomingState))
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/AcquireExternal", "external resource incoming state does not match the Package contract"));
+
             externalNativeResources_[contract.resource.value] = externalBindings_[slot].resource;
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = ToDxgi(externalView->format);
-            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Buffer.FirstElement = externalView->byteOffset / externalView->strideBytes;
-            srv.Buffer.NumElements = static_cast<UINT>(externalView->byteSize / externalView->strideBytes);
-            srv.Buffer.StructureByteStride = externalView->strideBytes;
-            auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
-            cpu.ptr += static_cast<SIZE_T>(DescriptorIndex(*externalView)) * shaderDescriptorIncrement_;
-            device_->CreateShaderResourceView(native->Native(), &srv, cpu);
+            const auto& resource = view_.Resources()[contract.resource.value];
+            const std::uint64_t viewEnd = static_cast<std::uint64_t>(resource.firstView) + resource.viewCount;
+            if (viewEnd > view_.Views().size())
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/AcquireExternal", "external resource view range is invalid"));
+            for (std::uint32_t index = resource.firstView; index < viewEnd; ++index)
+            {
+                const auto& externalView = view_.Views()[index];
+                if (externalView.viewClass != pkg::ViewClass::ShaderResource &&
+                    externalView.viewClass != pkg::ViewClass::UnorderedAccess)
+                    continue;
+                if (!shaderHeap_ || externalView.strideBytes == 0 || externalView.byteSize == 0 ||
+                    externalView.byteOffset % externalView.strideBytes != 0 ||
+                    externalView.byteSize % externalView.strideBytes != 0)
+                    return base::Result<void, runtime::RuntimeError>::Failure(
+                        Error("frame/AcquireExternal", "external descriptor-backed Buffer view is invalid"));
+                auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
+                cpu.ptr += static_cast<SIZE_T>(DescriptorIndex(externalView)) * shaderDescriptorIncrement_;
+                if (externalView.viewClass == pkg::ViewClass::ShaderResource)
+                {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Format = ToDxgi(externalView.format);
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.Buffer.FirstElement = externalView.byteOffset / externalView.strideBytes;
+                    srv.Buffer.NumElements = static_cast<UINT>(externalView.byteSize / externalView.strideBytes);
+                    srv.Buffer.StructureByteStride = externalView.strideBytes;
+                    device_->CreateShaderResourceView(native->Native(), &srv, cpu);
+                }
+                else
+                {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                    uav.Format = ToDxgi(externalView.format);
+                    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    uav.Buffer.FirstElement = externalView.byteOffset / externalView.strideBytes;
+                    uav.Buffer.NumElements = static_cast<UINT>(externalView.byteSize / externalView.strideBytes);
+                    uav.Buffer.StructureByteStride = externalView.strideBytes;
+                    device_->CreateUnorderedAccessView(native->Native(), nullptr, &uav, cpu);
+                }
+            }
             externalAcquired_[slot] = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
@@ -1257,8 +1512,9 @@ private:
                 !externalAcquired_[slot] || externalWaited_[slot])
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitExternal", "external wait order, slot, or Package queue is invalid"));
             auto* token = dynamic_cast<CompletionToken*>(externalBindings_[slot].availableAfter.get());
-            if (!token)
-                return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/WaitExternal", "external completion token implementation is invalid"));
+            if (!token || token->Owner() != this || token->Slot() != slot)
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/WaitExternal", "external completion token implementation, ownership, or slot is invalid"));
             const HRESULT hr = NativeQueue(operation.queue)->Wait(token->NativeFence(), token->Value());
             if (FAILED(hr)) return base::Result<void, runtime::RuntimeError>::Failure(HResultError("frame/wait-external", hr, device_.Get()));
             externalWaited_[slot] = true;
@@ -1422,8 +1678,13 @@ private:
             const auto& contract = view_.ExternalSlots()[slot];
             if (!(TrackedState(contract.resource) == contract.guaranteedOutgoingState))
                 return base::Result<void, runtime::RuntimeError>::Failure(Error("frame/ReleaseExternal", "external outgoing state does not match the package contract"));
+            auto* native = dynamic_cast<ExternalBufferResource*>(externalBindings_[slot].resource.get());
+            if (!native || native->Owner() != this)
+                return base::Result<void, runtime::RuntimeError>::Failure(
+                    Error("frame/ReleaseExternal", "external resource ownership is invalid"));
+            native->SetCurrentState(contract.guaranteedOutgoingState);
             frameExternalReleases_.push_back({slot, std::make_shared<CompletionToken>(
-                FenceReference(signal->second.queue), signal->second.fenceValue, deviceEpoch_)});
+                FenceReference(signal->second.queue), signal->second.fenceValue, deviceEpoch_, this, slot)});
             externalReleased_[slot] = true;
             return base::Result<void, runtime::RuntimeError>::Success();
         }
@@ -1913,23 +2174,42 @@ private:
                 list = commandList_.Get();
         }
         if (!list)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "Package-declared Copy-capable queue batch is not open"));
-        if (!payload.source.IsValid() || !payload.destination.IsValid() ||
-            payload.source.value >= resources_.size() || payload.destination.value >= resources_.size() ||
-            ResourceObject(payload.source) == nullptr || ResourceObject(payload.destination) == nullptr || payload.bytes == 0)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "copy resource reference is invalid"));
-        const auto& sourceArtifact = view_.Resources()[payload.source.value];
-        const auto& destinationArtifact = view_.Resources()[payload.destination.value];
-        if (sourceArtifact.resourceKind != pkg::ResourceKind::Buffer || destinationArtifact.resourceKind != pkg::ResourceKind::Buffer ||
-            payload.sourceOffset + payload.bytes > sourceArtifact.sizeBytes ||
-            payload.destinationOffset + payload.bytes > destinationArtifact.sizeBytes)
+            return base::Result<void, runtime::RuntimeError>::Failure(
+                Error(stage, "Package-declared Copy-capable queue batch is not open"));
+        if (!payload.sourceView.IsValid() || !payload.destinationView.IsValid() ||
+            payload.sourceView.value >= view_.Views().size() ||
+            payload.destinationView.value >= view_.Views().size() || payload.bytes == 0)
+            return base::Result<void, runtime::RuntimeError>::Failure(
+                Error(stage, "copy view reference is invalid"));
+        const auto& sourceView = view_.Views()[payload.sourceView.value];
+        const auto& destinationView = view_.Views()[payload.destinationView.value];
+        if (sourceView.viewClass != pkg::ViewClass::CopySource ||
+            destinationView.viewClass != pkg::ViewClass::CopyDestination ||
+            !sourceView.resource.IsValid() || !destinationView.resource.IsValid() ||
+            sourceView.resource.value >= view_.Resources().size() ||
+            destinationView.resource.value >= view_.Resources().size() ||
+            ResourceObject(sourceView) == nullptr || ResourceObject(destinationView) == nullptr)
+            return base::Result<void, runtime::RuntimeError>::Failure(
+                Error(stage, "copy views or physical instances are invalid"));
+        const auto& sourceArtifact = view_.Resources()[sourceView.resource.value];
+        const auto& destinationArtifact = view_.Resources()[destinationView.resource.value];
+        if (sourceArtifact.resourceKind != pkg::ResourceKind::Buffer ||
+            destinationArtifact.resourceKind != pkg::ResourceKind::Buffer ||
+            payload.sourceOffset > sourceView.byteSize ||
+            payload.bytes > sourceView.byteSize - payload.sourceOffset ||
+            payload.destinationOffset > destinationView.byteSize ||
+            payload.bytes > destinationView.byteSize - payload.destinationOffset)
             return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "copy range is invalid"));
-        const pkg::ResourceState copySourceState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopySource)};
-        const pkg::ResourceState copyDestinationState{pkg::StateClass::Explicit, 0, static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopyDestination)};
-        if (TrackedState(payload.source) != copySourceState || TrackedState(payload.destination) != copyDestinationState)
-            return base::Result<void, runtime::RuntimeError>::Failure(Error(stage, "copy resources are not in Package-planned states"));
-        list->CopyBufferRegion(ResourceObject(payload.destination), payload.destinationOffset,
-            ResourceObject(payload.source), payload.sourceOffset, payload.bytes);
+        const pkg::ResourceState copySourceState{pkg::StateClass::Explicit, 0,
+            static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopySource)};
+        const pkg::ResourceState copyDestinationState{pkg::StateClass::Explicit, 0,
+            static_cast<std::uint32_t>(pkg::ExplicitStateBits::CopyDestination)};
+        if (TrackedState(sourceView) != copySourceState || TrackedState(destinationView) != copyDestinationState)
+            return base::Result<void, runtime::RuntimeError>::Failure(
+                Error(stage, "copy views are not in Package-planned states"));
+        list->CopyBufferRegion(ResourceObject(destinationView),
+            destinationView.byteOffset + payload.destinationOffset,
+            ResourceObject(sourceView), sourceView.byteOffset + payload.sourceOffset, payload.bytes);
         return base::Result<void, runtime::RuntimeError>::Success();
     }
 
@@ -2714,13 +2994,35 @@ base::Result<runtime::DeviceRecoveryReport, runtime::RuntimeError> D3D12Executor
     return d3dInstance->RecoverDevice(mode);
 }
 
+base::Result<ExternalBufferBinding, runtime::RuntimeError> D3D12Executor::CreateExternalBuffer(
+    runtime::IPackageInstance& instance,
+    std::uint32_t slot,
+    std::span<const std::byte> initialBytes)
+{
+    auto* d3dInstance = dynamic_cast<Instance*>(&instance);
+    if (!d3dInstance)
+        return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(
+            Error("external", "package instance belongs to a different executor"));
+    return d3dInstance->CreateExternalBuffer(slot, initialBytes);
+}
+
+base::Result<ExternalBufferReadback, runtime::RuntimeError> D3D12Executor::ReadExternalBuffer(
+    runtime::IPackageInstance& instance,
+    const std::shared_ptr<runtime::IExternalResource>& resource,
+    const std::shared_ptr<runtime::ICompletionToken>& safeAfter)
+{
+    auto* d3dInstance = dynamic_cast<Instance*>(&instance);
+    if (!d3dInstance)
+        return base::Result<ExternalBufferReadback, runtime::RuntimeError>::Failure(
+            Error("external/readback", "package instance belongs to a different executor"));
+    return d3dInstance->ReadExternalBuffer(resource, safeAfter);
+}
+
 base::Result<ExternalBufferBinding, runtime::RuntimeError> D3D12Executor::CreateExternalColorBuffer(
     runtime::IPackageInstance& instance,
     const std::array<float, 4>& color)
 {
-    auto* d3dInstance = dynamic_cast<Instance*>(&instance);
-    if (!d3dInstance) return base::Result<ExternalBufferBinding, runtime::RuntimeError>::Failure(Error("external", "package instance belongs to a different executor"));
-    return d3dInstance->CreateExternalColorBuffer(color);
+    return CreateExternalBuffer(instance, 0, std::as_bytes(std::span<const float>(color)));
 }
 
 bool D3D12Executor::SupportsOperation(pkg::D3D12OperationCode code) noexcept

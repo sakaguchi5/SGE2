@@ -40,6 +40,8 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "25_Level2Scenarios", "25_Le
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "26_Level2GeneratedGraphs", "26_Level2GeneratedGraphs\26_Level2GeneratedGraphs.vcxproj", "{6C2A54F0-7E4B-4E88-9F41-2F6AD7C9B120}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "27_Level2RuntimeScenarios", "27_Level2RuntimeScenarios\27_Level2RuntimeScenarios.vcxproj", "{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}"
+EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "30_SemanticTests", "30_SemanticTests\30_SemanticTests.vcxproj", "{78E06D68-D46E-5229-BE08-E3BC9C7D2912}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "31_CompilerTests", "31_CompilerTests\31_CompilerTests.vcxproj", "{099F5488-1F7A-5EA6-A551-B5DA1A13EE02}"
@@ -59,6 +61,8 @@ EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "38_Level2MetamorphicTests", "38_Level2MetamorphicTests\38_Level2MetamorphicTests.vcxproj", "{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "39_Level2GeneratedGraphTests", "39_Level2GeneratedGraphTests\39_Level2GeneratedGraphTests.vcxproj", "{9F6D3A21-C8B4-4A57-8E02-6C7F1D5B9340}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "42_Level2RuntimeSemanticTests", "42_Level2RuntimeSemanticTests\42_Level2RuntimeSemanticTests.vcxproj", "{42D72C3E-8A65-4C1F-B092-6E3F15A9D847}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "40_Launcher", "40_Launcher\40_Launcher.vcxproj", "{ADA94B9E-8FBE-5406-A7A8-4EE888BDCA5E}"
 EndProject
@@ -194,6 +198,14 @@ Global
 		{9F6D3A21-C8B4-4A57-8E02-6C7F1D5B9340}.Debug|x64.Build.0 = Debug|x64
 		{9F6D3A21-C8B4-4A57-8E02-6C7F1D5B9340}.Release|x64.ActiveCfg = Release|x64
 		{9F6D3A21-C8B4-4A57-8E02-6C7F1D5B9340}.Release|x64.Build.0 = Release|x64
+		{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}.Debug|x64.ActiveCfg = Debug|x64
+		{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}.Debug|x64.Build.0 = Debug|x64
+		{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}.Release|x64.ActiveCfg = Release|x64
+		{27A86E9C-6D4F-4A63-9C18-2E7B4F610A52}.Release|x64.Build.0 = Release|x64
+		{42D72C3E-8A65-4C1F-B092-6E3F15A9D847}.Debug|x64.ActiveCfg = Debug|x64
+		{42D72C3E-8A65-4C1F-B092-6E3F15A9D847}.Debug|x64.Build.0 = Debug|x64
+		{42D72C3E-8A65-4C1F-B092-6E3F15A9D847}.Release|x64.ActiveCfg = Release|x64
+		{42D72C3E-8A65-4C1F-B092-6E3F15A9D847}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

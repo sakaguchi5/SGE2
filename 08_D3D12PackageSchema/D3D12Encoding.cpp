@@ -18,8 +18,8 @@ namespace sge::package::d3d12_v13
 {
 namespace
 {
-constexpr std::uint32_t TargetSchemaVersion = 16;
-constexpr std::uint32_t MinimumRuntimeVersion = 16;
+constexpr std::uint32_t TargetSchemaVersion = 17;
+constexpr std::uint32_t MinimumRuntimeVersion = 17;
 constexpr std::uint32_t ManifestStride = 72;
 constexpr std::uint32_t ProfileStride = 80;
 constexpr std::uint32_t ResourceStride = 96;
@@ -357,7 +357,7 @@ base::Result<TargetProfile, PackageError> DecodeProfileRecord(base::BinaryReader
         profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc ||
         profile.shaderModelMajor != 5 || profile.shaderModelMinor > 1 ||
         profile.rootSignatureMajor != 1 || profile.rootSignatureMinor > 1)
-        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v16 capability", section));
+        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v17 capability", section));
     return base::Result<TargetProfile, PackageError>::Success(profile);
 }
 
@@ -904,6 +904,7 @@ std::uint16_t ExpectedOperationVersion(D3D12OperationCode code)
     case D3D12OperationCode::WaitQueue:
     case D3D12OperationCode::WaitTemporal:
     case D3D12OperationCode::ReleaseExternal:
+    case D3D12OperationCode::ExecuteCopy:
         return 2;
     default:
         return 1;
@@ -1182,9 +1183,21 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             {
                 auto payload = DecodeCopyBuffer(operation.payload);
                 if (load || !payload || !batchOpen[operation.queue.value] ||
-                    !resourceValid(payload.Value().source) || !resourceValid(payload.Value().destination) ||
+                    !viewValid(payload.Value().sourceView) || !viewValid(payload.Value().destinationView) ||
                     payload.Value().bytes == 0)
                     return fail("ExecuteCopy payload is invalid");
+                const auto& sourceView = view.Views()[payload.Value().sourceView.value];
+                const auto& destinationView = view.Views()[payload.Value().destinationView.value];
+                if (sourceView.viewClass != ViewClass::CopySource ||
+                    destinationView.viewClass != ViewClass::CopyDestination ||
+                    !resourceValid(sourceView.resource) || !resourceValid(destinationView.resource) ||
+                    view.Resources()[sourceView.resource.value].resourceKind != ResourceKind::Buffer ||
+                    view.Resources()[destinationView.resource.value].resourceKind != ResourceKind::Buffer ||
+                    payload.Value().sourceOffset > sourceView.byteSize ||
+                    payload.Value().bytes > sourceView.byteSize - payload.Value().sourceOffset ||
+                    payload.Value().destinationOffset > destinationView.byteSize ||
+                    payload.Value().bytes > destinationView.byteSize - payload.Value().destinationOffset)
+                    return fail("ExecuteCopy views or copy range are invalid");
                 break;
             }
             case D3D12OperationCode::SignalQueue:
@@ -1990,8 +2003,8 @@ std::vector<std::byte> Encode(const ExecuteComputePayload& payload)
 std::vector<std::byte> Encode(const CopyBufferPayload& payload)
 {
     base::BinaryWriter writer;
-    WriteId(writer, payload.source);
-    WriteId(writer, payload.destination);
+    WriteId(writer, payload.sourceView);
+    WriteId(writer, payload.destinationView);
     writer.WriteU64(payload.sourceOffset);
     writer.WriteU64(payload.destinationOffset);
     writer.WriteU64(payload.bytes);
@@ -2158,12 +2171,12 @@ base::Result<ExecuteComputePayload, PackageError> DecodeExecuteCompute(std::span
 base::Result<CopyBufferPayload, PackageError> DecodeCopyBuffer(std::span<const std::byte> bytes)
 {
     return DecodePayload<CopyBufferPayload>(bytes, 32, [](base::BinaryReader& reader) {
-        auto source = reader.ReadU32(); auto destination = reader.ReadU32();
+        auto sourceView = reader.ReadU32(); auto destinationView = reader.ReadU32();
         auto sourceOffset = reader.ReadU64(); auto destinationOffset = reader.ReadU64(); auto count = reader.ReadU64();
-        if (!source || !destination || !sourceOffset || !destinationOffset || !count)
+        if (!sourceView || !destinationView || !sourceOffset || !destinationOffset || !count)
             return base::Result<CopyBufferPayload, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "ExecuteCopy payload is invalid"));
         return base::Result<CopyBufferPayload, PackageError>::Success(
-            {{source.Value()}, {destination.Value()}, sourceOffset.Value(), destinationOffset.Value(), count.Value()});
+            {{sourceView.Value()}, {destinationView.Value()}, sourceOffset.Value(), destinationOffset.Value(), count.Value()});
     });
 }
 base::Result<SignalQueuePayload, PackageError> DecodeSignalQueue(std::span<const std::byte> bytes)

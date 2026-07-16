@@ -494,8 +494,10 @@ struct ExecuteRasterPayload final { RasterCommandId command; };
 struct ExecuteComputePayload final { ComputeCommandId command; };
 struct CopyBufferPayload final
 {
-    ResourceId source;
-    ResourceId destination;
+    // Copy uses exact Package views rather than only Resource IDs so Temporal
+    // Previous/Current and other physical-instance meaning remain frozen.
+    ViewId sourceView;
+    ViewId destinationView;
     std::uint64_t sourceOffset = 0;
     std::uint64_t destinationOffset = 0;
     std::uint64_t bytes = 0;

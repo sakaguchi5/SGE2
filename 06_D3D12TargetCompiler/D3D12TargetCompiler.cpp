@@ -1429,7 +1429,8 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             code == pkg::D3D12OperationCode::SignalQueue ||
             code == pkg::D3D12OperationCode::WaitQueue ||
             code == pkg::D3D12OperationCode::WaitTemporal ||
-            code == pkg::D3D12OperationCode::ReleaseExternal ? 2u : 1u;
+            code == pkg::D3D12OperationCode::ReleaseExternal ||
+            code == pkg::D3D12OperationCode::ExecuteCopy ? 2u : 1u;
         description.operations.push_back({code, operationVersion, 0, queue, std::move(payload)});
     };
 
@@ -1670,8 +1671,8 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             if (sourceUse == nullptr || destinationUse == nullptr)
                 return Failure<LoweredPackageStage>("operation-lowering", "validated Copy Work has missing operands");
             addOperation(pkg::D3D12OperationCode::ExecuteCopy, queue,
-                pkg::Encode(pkg::CopyBufferPayload{resourceMap.at(sourceUse->resource.value),
-                    resourceMap.at(destinationUse->resource.value), 0, 0, work.copy.bytes}));
+                pkg::Encode(pkg::CopyBufferPayload{viewMap.at(sourceUse->id.value),
+                    viewMap.at(destinationUse->id.value), 0, 0, work.copy.bytes}));
         }
         else if (work.kind == semantic::WorkKind::Compute)
         {
