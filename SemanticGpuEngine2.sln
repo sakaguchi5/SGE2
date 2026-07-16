@@ -72,12 +72,36 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "40_Launcher", "40_Launcher\
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "41_PackageCompiler", "41_PackageCompiler\41_PackageCompiler.vcxproj", "{63825FD2-9A95-58AD-B4D5-BF5249EB5E1A}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "12_Level3PlanModel", "12_Level3PlanModel\12_Level3PlanModel.vcxproj", "{12A3B4C5-D6E7-4890-A123-B456C789D012}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "13_Level3PlanVerifier", "13_Level3PlanVerifier\13_Level3PlanVerifier.vcxproj", "{13A4B5C6-D7E8-4901-B234-C567D890E123}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "45_Level3PlanningTests", "45_Level3PlanningTests\45_Level3PlanningTests.vcxproj", "{45C3D4E5-F607-489A-8B01-C2D3E4F50617}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "46_Level3RuntimeTests", "46_Level3RuntimeTests\46_Level3RuntimeTests.vcxproj", "{46D4E5F6-0718-49AB-9C12-D3E4F5061728}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
 		Release|x64 = Release|x64
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{12A3B4C5-D6E7-4890-A123-B456C789D012}.Debug|x64.ActiveCfg = Debug|x64
+		{12A3B4C5-D6E7-4890-A123-B456C789D012}.Debug|x64.Build.0 = Debug|x64
+		{12A3B4C5-D6E7-4890-A123-B456C789D012}.Release|x64.ActiveCfg = Release|x64
+		{12A3B4C5-D6E7-4890-A123-B456C789D012}.Release|x64.Build.0 = Release|x64
+		{13A4B5C6-D7E8-4901-B234-C567D890E123}.Debug|x64.ActiveCfg = Debug|x64
+		{13A4B5C6-D7E8-4901-B234-C567D890E123}.Debug|x64.Build.0 = Debug|x64
+		{13A4B5C6-D7E8-4901-B234-C567D890E123}.Release|x64.ActiveCfg = Release|x64
+		{13A4B5C6-D7E8-4901-B234-C567D890E123}.Release|x64.Build.0 = Release|x64
+		{45C3D4E5-F607-489A-8B01-C2D3E4F50617}.Debug|x64.ActiveCfg = Debug|x64
+		{45C3D4E5-F607-489A-8B01-C2D3E4F50617}.Debug|x64.Build.0 = Debug|x64
+		{45C3D4E5-F607-489A-8B01-C2D3E4F50617}.Release|x64.ActiveCfg = Release|x64
+		{45C3D4E5-F607-489A-8B01-C2D3E4F50617}.Release|x64.Build.0 = Release|x64
+		{46D4E5F6-0718-49AB-9C12-D3E4F5061728}.Debug|x64.ActiveCfg = Debug|x64
+		{46D4E5F6-0718-49AB-9C12-D3E4F5061728}.Debug|x64.Build.0 = Debug|x64
+		{46D4E5F6-0718-49AB-9C12-D3E4F5061728}.Release|x64.ActiveCfg = Release|x64
+		{46D4E5F6-0718-49AB-9C12-D3E4F5061728}.Release|x64.Build.0 = Release|x64
 		{E91746D8-5978-5680-B802-1D9C7D18E81A}.Debug|x64.ActiveCfg = Debug|x64
 		{E91746D8-5978-5680-B802-1D9C7D18E81A}.Debug|x64.Build.0 = Debug|x64
 		{E91746D8-5978-5680-B802-1D9C7D18E81A}.Release|x64.ActiveCfg = Release|x64

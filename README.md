@@ -1,14 +1,16 @@
-# Semantic GPU Engine 2 — Level 2 Complete
+# Semantic GPU Engine 2 — Level 3 Complete
 
-Semantic GPU Engine 2 Level 2 is frozen at D3D12 target schema 17 and minimum Runtime 17. The Compiler accepts the declared finite semantic vocabulary with unfixed resource/Work cardinality and finite-DAG shape, freezes every execution decision into a source-independent Package, and rejects unsupported or malformed inputs before D3D12 materialization.
+Semantic GPU Engine 2 Level 3 is frozen at D3D12 target schema 17 and minimum Runtime 17. For one semantic obligation, the Compiler can construct multiple valid schedule, Queue, and allocation Plans; an independent Verifier checks them before policy selection; and only the selected Plan is lowered into the source-independent Frozen Package. Runtime and Backend remain unaware of planning, verification, cost, policy, and profiling.
 
 The authoritative completion command is:
 
 ```powershell
-.\run_level2_final.bat
+.\run_level3_final.bat
 ```
 
-It runs the complete suite in Debug and Release, verifies architectural dependency boundaries, recompiles the fixed 54-Package corpus in same and fresh processes, and requires the Debug/Release freeze manifests to be byte-identical. See [the final capability constitution](docs/LEVEL2_CAPABILITY_CONSTITUTION_FINAL.md), [qualification corpus](docs/LEVEL2_QUALIFICATION_CORPUS.md), and [Stage M procedure](docs/LEVEL2_STAGE_M.md).
+It first reruns the complete Level 2 freeze, including the byte-identical fixed 54-Package corpus. It then qualifies the Level 3 obligation and Plan encodings, independent Verifier, adversarial mutations, bounded candidate generation, cost/policy selection, profile-aware offline reselection, WARP observation equivalence, and same-process/fresh-process/Debug/Release manifest determinism. See the [Level 3 capability constitution](docs/current/SGE2_Level3_Capability_Constitution.md), [observation contract](docs/current/SGE2_Level3_Observation_Contract.md), and [qualification record](docs/current/SGE2_Level3_Qualification.md).
+
+The selected Plan still uses Package schema 17. That schema represents Placed allocation only as a two-resource alias group, so `PlacedNoAlias` is a named unsupported capability and is rejected by the independent Verifier. It is not silently encoded as another strategy; supporting it requires an explicit future schema/runtime revision.
 
 The Slice 15 experiment below remains the retained Level 1 reference input and cross-frontend equivalence proof.
 
@@ -82,6 +84,7 @@ The Slice 13 lifecycle corrections remain included: process-once Debug Layer/DRE
 .\run_demo.bat Debug --warp --force-removal
 .\verify_dependencies.ps1
 .\run_level2_final.bat
+.\run_level3_final.bat
 ```
 
 `41_PackageCompiler` accepts a frontend selector:
@@ -95,7 +98,7 @@ The Slice 13 lifecycle corrections remain included: process-once Debug Layer/DRE
 
 The default is `all`. The old Slice-14 spelling `both` is retained as an alias for `all`. In equivalence mode the compiler refuses to write a Package unless all three frontends agree on geometry, execution digest, and every Package byte.
 
-The standard test command retains the earlier output below. The final-freeze command ends with `SGE2 LEVEL 2 FINAL FREEZE PASSED` and `Semantic GPU Engine 2 Level 2 is complete.`
+The standard test command retains the earlier output below. The Level 3 final-freeze command ends with `SGE2 LEVEL 3 FINAL FREEZE PASSED` and `Semantic GPU Engine 2 Level 3 is complete.`
 
 Expected retained lines include:
 
@@ -108,4 +111,4 @@ All Slice-15 tests passed.
 
 ## Project boundary
 
-`20_ClassicalFrontend`, `21_SdfFrontend`, and `22_PgaFrontend` cannot reference one another. All three may depend on neutral `23_ExperimentDomain`. `10_D3D12Executor`, `35_D3D12ReadbackTests`, and `40_Launcher` remain unable to reference Semantic, Compiler, Experiment, or Frontend projects.
+`20_ClassicalFrontend`, `21_SdfFrontend`, and `22_PgaFrontend` cannot reference one another. All three may depend on neutral `23_ExperimentDomain`. `12_Level3PlanModel` and `13_Level3PlanVerifier` are source/compiler-side libraries and cannot reference the Compiler, Runtime, Executor, or Platform projects; the Verifier also does not reuse Planner validation helpers. `10_D3D12Executor`, `35_D3D12ReadbackTests`, and `40_Launcher` remain unable to reference Semantic, Compiler, Experiment, Frontend, or Level 3 planning projects.

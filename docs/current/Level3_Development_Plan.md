@@ -209,60 +209,92 @@ memory observations
 
 Profileを使って別Planを選ぶ場合は新しいCompileを行い、新Packageと新execution digestを生成する。Runtimeが既存Packageを変更してはならない。
 
-## 10. Proposed stages
+## 10. Formal stages N-Z
 
-### Stage N - Vocabulary and identity freeze
+### Stage N - Level 3 capability boundary freeze
 
-- SemanticObligation型
-- ExecutionPlanIR型
-- PlanIdentity canonical encoding
-- Level 2 Canonical PlanをIRへ移す
-- bytes regressionを維持
+- capability constitutionとobservation contract
+- Candidate axisとbudgetの固定
+- Schema 17 / Runtime 17維持
+- Level 2 CanonicalSafePlanの定義
 
-### Stage O - Independent verifier core
+### Stage O - Semantic Obligationの独立化
 
-- schedule/dependency/hazard
-- Queue capability
-- state continuity
-- diagnostics
-- intentionally invalid Plan corpus
+- Target非依存のSemanticObligation
+- D3D12PlanningContract
+- canonical encodingとdigest
+- PlannerからSemanticGraph直接参照を除去
 
-### Stage P - Queue candidates
+### Stage P - ExecutionPlanIRとCanonicalSafePlanner
 
-- Direct/dedicated Compute/Copy候補
-- SignalPoint/Wait generation
-- verifierとsemantic Readback
+- Plan-local identity
+- Level 2と同じ判断を行うCanonicalSafePlanner
+- PlanからSchema 17への機械的Lowering
+- 固定54 corpusのPackage byte回帰
 
-### Stage Q - Allocation candidates
+### Stage Q - Independent Verifier Core
 
-- committed/placed/alias候補
-- lifetime/alias verifier
-- peak memory Cost vector
+- exactly-once schedule、dependency、hazard
+- Queue capability、Signal/Wait、happens-before
+- Planner helperを参照しない診断
 
-### Stage R - Candidate manifest and deterministic selection
+### Stage R - Resource / State / Boundary Verifier
 
-- Candidate list
-- PlanIdentity
-- Cost vector
-- Policy/tie-break
-- fresh-process/Debug/Release identity
+- physical instance、lifetime、allocation、alias
+- state continuity、View、binding
+- Dynamic、External、Temporal、Surface、Present boundary
 
-### Stage S - Profile record and offline reselection
+### Stage S - Plan Adversarial Qualification
 
-- measurement sidecar
-- profile provenance
-- profile-guided recompile
-- Runtime mutation禁止の証明
+- Plan field mutation corpus
+- small DAG independent oracle
+- Package lowering前の全拒否
 
-### Stage T - Level 3 qualification and freeze
+### Stage T - Candidate Framework and Manifest
 
-- fixed multi-plan corpus
-- independent verifier adversarial corpus
-- semantic equivalence across selected Plans
-- Safe Plan fallback
-- final manifest freeze
+- bounded candidate enumeration
+- PlanIdentity deduplication
+- verified candidate manifest
+- repeated/fresh/Debug/Release determinism
 
-Stage名はLevel 3実装開始時に正式確定する。Level 2のStage A-M historyは変更しない。
+### Stage U - Topological Schedule Candidates
+
+- minimum-ID、maximum-ID、critical-path、Queue-affinity schedule
+- PlanIdentity deduplication
+- partial orderとGPU observation equivalence
+
+### Stage V - Queue Assignment Candidates
+
+- AllDirect、KindPreferredDedicated、MinimizeCrossQueueEdges
+- bounded per-Work alternatives
+- PlanごとのSignal/Wait生成と検証
+
+### Stage W - Allocation / Alias Candidates
+
+- ConservativeCommitted、CanonicalAlias、MemoryAggressiveAlias
+- PlacedNoAliasはPlan vocabularyに保持するが、Schema 17 capabilityではVerifierがreject
+- deterministic safe fallback
+- peak/reserved bytesとalias activation cost
+
+### Stage X - Cost Vector / Policy / Selection
+
+- hard constraints、lexicographic、Pareto frontier
+- stable PlanIdentity tie-break
+- CanonicalSafe、memory、handoff、dedicated Queue、operation policy
+
+### Stage Y - Profile Record and Offline Reselection
+
+- Package外のversion付きProfile sidecar
+- provenance検証
+- fixed Profile inputからの決定的な再選択と新Package生成
+
+### Stage Z - Level 3 Final Qualification and Freeze
+
+- Level 2 regression、multi-plan、invalid Plan、Profile corpus
+- semantic observation、recovery、dependency boundary
+- final manifestとauthoritative command
+
+このN-ZをLevel 3 D3D12 v1の正式Stage名とする。Level 2のStage A-M historyは変更しない。
 
 ## 11. Completion criteria
 

@@ -14,6 +14,7 @@
 #include "../02_SemanticModel/SemanticModel.h"
 #include "../04_SemanticAnalysis/SemanticAnalysis.h"
 #include "../05_TargetModel/TargetModel.h"
+#include "../12_Level3PlanModel/Level3PlanModel.h"
 
 #ifdef SGE_D3D12_TARGET_COMPILER_RESTORE_INTERFACE_MACRO
 #pragma pop_macro("interface")
@@ -109,4 +110,12 @@ struct CompileOutput final
 [[nodiscard]] base::Result<CompileOutput, CompileError> Compile(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile);
+
+// Level 3 lowering entry. The caller must pass a plan accepted by the
+// independent Level3PlanVerifier. This function performs no candidate
+// generation or policy selection; it only materializes the selected plan.
+[[nodiscard]] base::Result<CompileOutput, CompileError> CompileSelectedPlan(
+    const semantic::SemanticGraph& graph,
+    const target::D3D12TargetProfile& targetProfile,
+    const level3::ExecutionPlanIR& selectedPlan);
 }

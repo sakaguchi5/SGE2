@@ -127,13 +127,16 @@ $sourceSide = @(
     '02_SemanticModel', '03_SemanticBuilder', '04_SemanticAnalysis', '05_TargetModel',
     '06_D3D12TargetCompiler', '20_ClassicalFrontend', '21_SdfFrontend',
     '22_PgaFrontend', '23_ExperimentDomain', '24_Level1Scenarios',
-    '25_Level2Scenarios', '26_Level2GeneratedGraphs', '27_Level2RuntimeScenarios'
+    '25_Level2Scenarios', '26_Level2GeneratedGraphs', '27_Level2RuntimeScenarios',
+    '12_Level3PlanModel', '13_Level3PlanVerifier'
 )
 $runtimeSide = @('09_PackageRuntime', '10_D3D12Executor', '11_PlatformWin32')
 
 Assert-NoForbiddenDependency '07_FrozenPackageCore' ($sourceSide + $runtimeSide)
 Assert-NoForbiddenDependency '08_D3D12PackageSchema' ($sourceSide + $runtimeSide)
 Assert-NoForbiddenDependency '06_D3D12TargetCompiler' $runtimeSide
+Assert-NoForbiddenDependency '12_Level3PlanModel' @('06_D3D12TargetCompiler', '09_PackageRuntime', '10_D3D12Executor', '11_PlatformWin32')
+Assert-NoForbiddenDependency '13_Level3PlanVerifier' @('06_D3D12TargetCompiler', '09_PackageRuntime', '10_D3D12Executor', '11_PlatformWin32')
 Assert-NoForbiddenDependency '09_PackageRuntime' $sourceSide
 Assert-NoForbiddenDependency '10_D3D12Executor' $sourceSide
 Assert-NoForbiddenDependency '35_D3D12ReadbackTests' $sourceSide

@@ -841,13 +841,15 @@ namespace
 {
 base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     const ValidatedSourceStage& validated,
-    const ProgramCompilationStage& compiledPrograms)
+    const ProgramCompilationStage& compiledPrograms,
+    const level3::ExecutionPlanIR* selectedPlan)
 {
     if (validated.source == nullptr)
         return Failure<LoweredPackageStage>("package-lowering", "validated source stage has no SemanticGraph");
     const auto& graph = *validated.source;
     const auto& targetProfile = validated.targetProfile;
     const auto& analyzed = validated.analyzed;
+    const auto& workOrder = selectedPlan == nullptr ? analyzed.canonicalWorkOrder : selectedPlan->workSchedule;
 
     std::map<std::uint32_t, const semantic::Resource*> resources;
     std::map<std::uint32_t, const semantic::ResourceUse*> uses;
@@ -1077,74 +1079,101 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         }
     }
 
-    // Stage D: alias intent belongs to Resource, not to a shader-input role.
-    // SemanticAnalysis has already validated shape compatibility and exclusive
-    // ownership of each Preparation resource.
-    std::map<std::uint32_t, analysis::ResourceLifetime> lifetimes;
-    for (const auto& lifetime : analyzed.resourceLifetimes)
-        lifetimes[lifetime.resource.value] = lifetime;
-    std::map<std::uint32_t, std::uint32_t> aliasPairs;
-    for (const auto resourceId : analyzed.canonicalResourceOrder)
+    if (selectedPlan != nullptr)
     {
-        const auto& targetResource = *resources.at(resourceId.value);
-        if (!targetResource.aliasPreparation.IsValid()) continue;
-        const auto& preparation = *resources.at(targetResource.aliasPreparation.value);
-        const auto& targetLifetime = lifetimes.at(targetResource.id.value);
-        const auto& preparationLifetime = lifetimes.at(preparation.id.value);
-        const bool nonOverlapping = !preparationLifetime.usedByWork || !targetLifetime.usedByWork ||
-            preparationLifetime.lastUse < targetLifetime.firstUse ||
-            targetLifetime.lastUse < preparationLifetime.firstUse;
-        if (!nonOverlapping)
-            return Failure<LoweredPackageStage>("allocation-planning", "explicit alias Resource lifetimes overlap");
-        aliasPairs[preparation.id.value] = targetResource.id.value;
-    }
-
-    std::map<std::uint32_t, pkg::AllocationId> allocationForResource;
-    std::set<std::uint32_t> allocatedResources;
-    std::uint32_t aliasGroup = 0;
-    for (const auto resourceId : analyzed.canonicalResourceOrder)
-    {
-        const auto packageResource = resourceMap.at(resourceId.value);
-        const auto& source = *resources.at(resourceId.value);
-        if (source.lifetime == semantic::LifetimeIntent::External || allocatedResources.contains(resourceId.value))
-            continue;
-
-        const auto pairAsPreparation = aliasPairs.find(resourceId.value);
-        auto pairAsTarget = std::find_if(aliasPairs.begin(), aliasPairs.end(), [&](const auto& pair) {
-            return pair.second == resourceId.value;
-        });
-        const bool aliased = pairAsPreparation != aliasPairs.end() || pairAsTarget != aliasPairs.end();
-        std::uint32_t partnerId = package::InvalidIndex;
-        if (pairAsPreparation != aliasPairs.end()) partnerId = pairAsPreparation->second;
-        if (pairAsTarget != aliasPairs.end()) partnerId = pairAsTarget->first;
-
-        const auto& sourceUseList = resourceUses[source.id.value];
-        pkg::AllocationArtifact allocation;
-        allocation.id = {static_cast<std::uint32_t>(description.allocations.size())};
-        allocation.kind = aliased ? pkg::AllocationKind::Placed : pkg::AllocationKind::Committed;
-        allocation.heapClass = HeapClassFor(source, sourceUseList);
-        allocation.physicalInstanceCount = description.resources[packageResource.value].physicalInstanceCount;
-        allocation.alignment = source.update == semantic::UpdateIntent::DynamicPerFrame ?
-            ConstantPlacementAlignment : DefaultPlacementAlignment;
-        allocation.sizeBytes = source.kind == semantic::ResourceKind::Buffer ?
-            (aliased ? AlignUp(source.buffer.sizeBytes, DefaultPlacementAlignment) :
-             description.resources[packageResource.value].sizeBytes) : 0;
-        allocation.aliasGroup = aliased ? aliasGroup++ : package::InvalidIndex;
-        description.allocations.push_back(allocation);
-
-        allocationForResource[source.id.value] = allocation.id;
-        description.resources[packageResource.value].allocation = allocation.id;
-        allocatedResources.insert(source.id.value);
-        if (aliased)
+        for (const auto& planned : selectedPlan->allocations)
         {
-            const auto partnerPackage = resourceMap.at(partnerId);
-            if (description.resources[partnerPackage.value].physicalInstanceCount != allocation.physicalInstanceCount)
-                return Failure<LoweredPackageStage>("allocation-planning", "alias candidates have incompatible physical instance counts");
-            allocationForResource[partnerId] = allocation.id;
-            description.resources[partnerPackage.value].allocation = allocation.id;
-            description.resources[packageResource.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
-            description.resources[partnerPackage.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
-            allocatedResources.insert(partnerId);
+            if (planned.id != description.allocations.size() || planned.resources.empty())
+                return Failure<LoweredPackageStage>("verified-plan-lowering", "Allocation identities are not canonical");
+            const auto firstSourceId = planned.resources.front().value;
+            const auto& firstSource = *resources.at(firstSourceId);
+            pkg::AllocationArtifact allocation;
+            allocation.id = {planned.id};
+            allocation.kind = planned.kind == level3::PlanAllocationKind::Placed ?
+                pkg::AllocationKind::Placed : pkg::AllocationKind::Committed;
+            allocation.heapClass = HeapClassFor(firstSource, resourceUses[firstSourceId]);
+            allocation.physicalInstanceCount = planned.physicalInstanceCount;
+            allocation.alignment = planned.alignment;
+            allocation.sizeBytes = planned.sizeBytes;
+            allocation.aliasGroup = planned.aliasGroup;
+            description.allocations.push_back(allocation);
+            for (const auto sourceId : planned.resources)
+            {
+                const auto packageResource = resourceMap.at(sourceId.value);
+                description.resources[packageResource.value].allocation = allocation.id;
+                if (planned.resources.size() > 1)
+                    description.resources[packageResource.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
+            }
+        }
+    }
+    else
+    {
+        // Stage D: alias intent belongs to Resource, not to a shader-input role.
+        // SemanticAnalysis has already validated shape compatibility and exclusive
+        // ownership of each Preparation resource.
+        std::map<std::uint32_t, analysis::ResourceLifetime> lifetimes;
+        for (const auto& lifetime : analyzed.resourceLifetimes)
+            lifetimes[lifetime.resource.value] = lifetime;
+        std::map<std::uint32_t, std::uint32_t> aliasPairs;
+        for (const auto resourceId : analyzed.canonicalResourceOrder)
+        {
+            const auto& targetResource = *resources.at(resourceId.value);
+            if (!targetResource.aliasPreparation.IsValid()) continue;
+            const auto& preparation = *resources.at(targetResource.aliasPreparation.value);
+            const auto& targetLifetime = lifetimes.at(targetResource.id.value);
+            const auto& preparationLifetime = lifetimes.at(preparation.id.value);
+            const bool nonOverlapping = !preparationLifetime.usedByWork || !targetLifetime.usedByWork ||
+                preparationLifetime.lastUse < targetLifetime.firstUse ||
+                targetLifetime.lastUse < preparationLifetime.firstUse;
+            if (!nonOverlapping)
+                return Failure<LoweredPackageStage>("allocation-planning", "explicit alias Resource lifetimes overlap");
+            aliasPairs[preparation.id.value] = targetResource.id.value;
+        }
+
+        std::set<std::uint32_t> allocatedResources;
+        std::uint32_t aliasGroup = 0;
+        for (const auto resourceId : analyzed.canonicalResourceOrder)
+        {
+            const auto packageResource = resourceMap.at(resourceId.value);
+            const auto& source = *resources.at(resourceId.value);
+            if (source.lifetime == semantic::LifetimeIntent::External || allocatedResources.contains(resourceId.value))
+                continue;
+
+            const auto pairAsPreparation = aliasPairs.find(resourceId.value);
+            auto pairAsTarget = std::find_if(aliasPairs.begin(), aliasPairs.end(), [&](const auto& pair) {
+                return pair.second == resourceId.value;
+            });
+            const bool aliased = pairAsPreparation != aliasPairs.end() || pairAsTarget != aliasPairs.end();
+            std::uint32_t partnerId = package::InvalidIndex;
+            if (pairAsPreparation != aliasPairs.end()) partnerId = pairAsPreparation->second;
+            if (pairAsTarget != aliasPairs.end()) partnerId = pairAsTarget->first;
+
+            const auto& sourceUseList = resourceUses[source.id.value];
+            pkg::AllocationArtifact allocation;
+            allocation.id = {static_cast<std::uint32_t>(description.allocations.size())};
+            allocation.kind = aliased ? pkg::AllocationKind::Placed : pkg::AllocationKind::Committed;
+            allocation.heapClass = HeapClassFor(source, sourceUseList);
+            allocation.physicalInstanceCount = description.resources[packageResource.value].physicalInstanceCount;
+            allocation.alignment = source.update == semantic::UpdateIntent::DynamicPerFrame ?
+                ConstantPlacementAlignment : DefaultPlacementAlignment;
+            allocation.sizeBytes = source.kind == semantic::ResourceKind::Buffer ?
+                (aliased ? AlignUp(source.buffer.sizeBytes, DefaultPlacementAlignment) :
+                 description.resources[packageResource.value].sizeBytes) : 0;
+            allocation.aliasGroup = aliased ? aliasGroup++ : package::InvalidIndex;
+            description.allocations.push_back(allocation);
+
+            description.resources[packageResource.value].allocation = allocation.id;
+            allocatedResources.insert(source.id.value);
+            if (aliased)
+            {
+                const auto partnerPackage = resourceMap.at(partnerId);
+                if (description.resources[partnerPackage.value].physicalInstanceCount != allocation.physicalInstanceCount)
+                    return Failure<LoweredPackageStage>("allocation-planning", "alias candidates have incompatible physical instance counts");
+                description.resources[partnerPackage.value].allocation = allocation.id;
+                description.resources[packageResource.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
+                description.resources[partnerPackage.value].flags |= static_cast<std::uint32_t>(pkg::ResourceFlags::Aliased);
+                allocatedResources.insert(partnerId);
+            }
         }
     }
 
@@ -1188,7 +1217,7 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     std::map<std::uint32_t, WorkArtifacts> workArtifacts;
     std::uint32_t descriptorBindingOffset = 0;
     std::uint32_t staticSamplerOffset = 0;
-    for (const auto workId : analyzed.canonicalWorkOrder)
+    for (const auto workId : workOrder)
     {
         const auto& work = *works.at(workId.value);
         if (work.kind != semantic::WorkKind::Raster && work.kind != semantic::WorkKind::Compute) continue;
@@ -1390,11 +1419,28 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     const pkg::QueueId copyQueue = targetProfile.copyQueueCount != 0 ?
         pkg::QueueId{targetProfile.directQueueCount + targetProfile.computeQueueCount} : directQueue;
     std::map<std::uint32_t, pkg::QueueId> workQueues;
-    for (const auto workId : analyzed.canonicalWorkOrder)
+    if (selectedPlan == nullptr)
     {
-        const auto kind = works.at(workId.value)->kind;
-        workQueues[workId.value] = kind == semantic::WorkKind::Copy ? copyQueue :
-                                   kind == semantic::WorkKind::Compute ? computeQueue : directQueue;
+        for (const auto workId : workOrder)
+        {
+            const auto kind = works.at(workId.value)->kind;
+            workQueues[workId.value] = kind == semantic::WorkKind::Copy ? copyQueue :
+                                       kind == semantic::WorkKind::Compute ? computeQueue : directQueue;
+        }
+    }
+    else
+    {
+        for (const auto& assignment : selectedPlan->queueAssignments)
+        {
+            pkg::QueueId queue;
+            if (assignment.queueClass == level3::QueueClass::Direct)
+                queue = {assignment.queueIndex};
+            else if (assignment.queueClass == level3::QueueClass::Compute)
+                queue = {targetProfile.directQueueCount + assignment.queueIndex};
+            else
+                queue = {targetProfile.directQueueCount + targetProfile.computeQueueCount + assignment.queueIndex};
+            workQueues[assignment.work.value] = queue;
+        }
     }
 
     // SignalPointId is local to one operation stream.  Frame points are assigned
@@ -1402,13 +1448,13 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     // in the current frame but belongs to the previous frame generation.
     std::map<std::uint32_t, pkg::SignalPointId> workSignalPoints;
     std::uint32_t nextFrameSignalPoint = 0;
-    for (const auto workId : analyzed.canonicalWorkOrder)
+    for (const auto workId : workOrder)
         workSignalPoints[workId.value] = {nextFrameSignalPoint++};
     const pkg::SignalPointId presentSignalPoint = description.surfaceSlots.empty() ?
         pkg::SignalPointId{} : pkg::SignalPointId{nextFrameSignalPoint++};
 
     std::map<std::uint32_t, std::uint32_t> temporalCurrentWriterWork;
-    for (const auto workId : analyzed.canonicalWorkOrder)
+    for (const auto workId : workOrder)
     {
         const auto& work = *works.at(workId.value);
         for (const auto& operand : work.operands)
@@ -1529,15 +1575,15 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
                      pkg::Encode(pkg::AcquireSurfaceImagePayload{slot.id}));
 
     std::map<std::uint32_t, std::uint32_t> workPosition;
-    for (std::uint32_t index = 0; index < analyzed.canonicalWorkOrder.size(); ++index)
-        workPosition[analyzed.canonicalWorkOrder[index].value] = index;
+    for (std::uint32_t index = 0; index < workOrder.size(); ++index)
+        workPosition[workOrder[index].value] = index;
     std::map<std::uint32_t, std::uint32_t> firstExternalUse;
     std::map<std::uint32_t, std::uint32_t> lastExternalUse;
     std::map<std::uint32_t, const semantic::ResourceUse*> firstExternalUseContract;
     std::map<std::uint32_t, const semantic::ResourceUse*> lastExternalUseContract;
-    for (std::uint32_t position = 0; position < analyzed.canonicalWorkOrder.size(); ++position)
+    for (std::uint32_t position = 0; position < workOrder.size(); ++position)
     {
-        const auto& work = *works.at(analyzed.canonicalWorkOrder[position].value);
+        const auto& work = *works.at(workOrder[position].value);
         for (const auto* operand : CanonicalOperands(work))
         {
             const auto* use = uses.at(operand->use.value);
@@ -1590,9 +1636,9 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         states[cell] = after;
     };
 
-    for (std::uint32_t position = 0; position < analyzed.canonicalWorkOrder.size(); ++position)
+    for (std::uint32_t position = 0; position < workOrder.size(); ++position)
     {
-        const auto workId = analyzed.canonicalWorkOrder[position];
+        const auto workId = workOrder[position];
         const auto& work = *works.at(workId.value);
         const auto queue = workQueues.at(work.id.value);
 
@@ -1693,9 +1739,9 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             if (rasterPresentationResources.contains(use->resource.value)) continue;
             pkg::ResourceState desired = baselineState(cell);
             bool nextFound = false;
-            for (std::uint32_t next = position + 1; next < analyzed.canonicalWorkOrder.size() && !nextFound; ++next)
+            for (std::uint32_t next = position + 1; next < workOrder.size() && !nextFound; ++next)
             {
-                const auto& nextWork = *works.at(analyzed.canonicalWorkOrder[next].value);
+                const auto& nextWork = *works.at(workOrder[next].value);
                 for (const auto* nextOperand : CanonicalOperands(nextWork))
                 {
                     const auto* nextUse = uses.at(nextOperand->use.value);
@@ -1728,7 +1774,7 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         if (sourceResource == resourceMap.end())
             return Failure<LoweredPackageStage>("external-boundary", "external Package resource has no Source resource mapping");
         const auto lastPosition = lastExternalUse.at(sourceResource->first);
-        const auto lastWork = analyzed.canonicalWorkOrder[lastPosition];
+        const auto lastWork = workOrder[lastPosition];
         addOperation(pkg::D3D12OperationCode::ReleaseExternal, noQueue,
                      pkg::Encode(pkg::ReleaseExternalPayload{slot.id, workSignalPoints.at(lastWork.value)}));
     }
@@ -1771,7 +1817,7 @@ base::Result<CompileOutput, CompileError> Compile(
     auto programs = CompileProgramStage(validated.Value());
     if (!programs)
         return base::Result<CompileOutput, CompileError>::Failure(programs.Error());
-    auto lowered = LowerPackageStage(validated.Value(), programs.Value());
+    auto lowered = LowerPackageStage(validated.Value(), programs.Value(), nullptr);
     if (!lowered)
         return base::Result<CompileOutput, CompileError>::Failure(lowered.Error());
     auto frozen = FreezePackageStage(std::move(lowered).Value());
@@ -1782,6 +1828,23 @@ base::Result<CompileOutput, CompileError> Compile(
         "shader-compilation-reflection",
         "package-lowering",
         "package-serialization-validation"};
+    return frozen;
+}
+
+base::Result<CompileOutput, CompileError> CompileSelectedPlan(
+    const semantic::SemanticGraph& graph,
+    const target::D3D12TargetProfile& targetProfile,
+    const level3::ExecutionPlanIR& selectedPlan)
+{
+    auto validated = ValidateSourceStage(graph, targetProfile);
+    if (!validated) return base::Result<CompileOutput, CompileError>::Failure(validated.Error());
+    auto programs = CompileProgramStage(validated.Value());
+    if (!programs) return base::Result<CompileOutput, CompileError>::Failure(programs.Error());
+    auto lowered = LowerPackageStage(validated.Value(), programs.Value(), &selectedPlan);
+    if (!lowered) return base::Result<CompileOutput, CompileError>::Failure(lowered.Error());
+    auto frozen = FreezePackageStage(std::move(lowered).Value());
+    if (frozen)
+        frozen.Value().completedStages = {"source-validation", "program-compilation", "verified-plan-lowering", "package-freeze"};
     return frozen;
 }
 }

@@ -66,9 +66,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="D3D12TargetCompiler.cpp" />
+    <ClCompile Include="Level3Compiler.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="D3D12TargetCompiler.h" />
+    <ClInclude Include="Level3Compiler.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Base\00_Base.vcxproj">
@@ -93,6 +95,14 @@
     </ProjectReference>
     <ProjectReference Include="..\08_D3D12PackageSchema\08_D3D12PackageSchema.vcxproj">
       <Project>{6BD85765-9971-5AAD-95B9-094A4BE4F739}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+    <ProjectReference Include="..\12_Level3PlanModel\12_Level3PlanModel.vcxproj">
+      <Project>{12A3B4C5-D6E7-4890-A123-B456C789D012}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+    <ProjectReference Include="..\13_Level3PlanVerifier\13_Level3PlanVerifier.vcxproj">
+      <Project>{13A4B5C6-D7E8-4901-B234-C567D890E123}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
   </ItemGroup>
