@@ -54,6 +54,8 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "36_Level1ScenarioTests", "3
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "37_Level1ExecutionTests", "37_Level1ExecutionTests\37_Level1ExecutionTests.vcxproj", "{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "38_Level2MetamorphicTests", "38_Level2MetamorphicTests\38_Level2MetamorphicTests.vcxproj", "{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}"
+EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "40_Launcher", "40_Launcher\40_Launcher.vcxproj", "{ADA94B9E-8FBE-5406-A7A8-4EE888BDCA5E}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "41_PackageCompiler", "41_PackageCompiler\41_PackageCompiler.vcxproj", "{63825FD2-9A95-58AD-B4D5-BF5249EB5E1A}"
@@ -176,6 +178,10 @@ Global
 		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Debug|x64.Build.0 = Debug|x64
 		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Release|x64.ActiveCfg = Release|x64
 		{3A7B4E5F-A1C2-4D8E-9F60-37B15E8C0247}.Release|x64.Build.0 = Release|x64
+		{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}.Debug|x64.ActiveCfg = Debug|x64
+		{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}.Debug|x64.Build.0 = Debug|x64
+		{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}.Release|x64.ActiveCfg = Release|x64
+		{0E9E9F1A-5D79-4A0D-91C8-A1499F095B38}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

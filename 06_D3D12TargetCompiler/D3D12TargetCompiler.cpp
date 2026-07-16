@@ -475,26 +475,75 @@ std::uint64_t AppendAligned(std::vector<std::byte>& destination,
     return offset;
 }
 
+const semantic::ProgramParameter* FindParameter(
+    const semantic::ProgramInterface& interfaceDescription,
+    semantic::ProgramParameterId id) noexcept
+{
+    const auto found = std::find_if(interfaceDescription.parameters.begin(),
+        interfaceDescription.parameters.end(),
+        [id](const semantic::ProgramParameter& parameter) { return parameter.id == id; });
+    return found == interfaceDescription.parameters.end() ? nullptr : &*found;
+}
+
+std::vector<const semantic::ProgramParameter*> CanonicalParameters(
+    const semantic::ProgramInterface& interfaceDescription)
+{
+    std::vector<const semantic::ProgramParameter*> result;
+    result.reserve(interfaceDescription.parameters.size());
+    for (const auto& parameter : interfaceDescription.parameters) result.push_back(&parameter);
+    std::sort(result.begin(), result.end(), [](const auto* left, const auto* right) {
+        return left->id.value < right->id.value;
+    });
+    return result;
+}
+
+std::vector<const semantic::VertexInput*> CanonicalVertexInputs(
+    const semantic::ProgramInterface& interfaceDescription)
+{
+    std::vector<const semantic::VertexInput*> result;
+    result.reserve(interfaceDescription.vertexInputs.size());
+    for (const auto& input : interfaceDescription.vertexInputs) result.push_back(&input);
+    std::sort(result.begin(), result.end(), [](const auto* left, const auto* right) {
+        return std::tuple{left->byteOffset, left->meaning, left->componentCount} <
+               std::tuple{right->byteOffset, right->meaning, right->componentCount};
+    });
+    return result;
+}
+
+std::vector<const semantic::WorkOperand*> CanonicalOperands(const semantic::Work& work)
+{
+    std::vector<const semantic::WorkOperand*> result;
+    result.reserve(work.operands.size());
+    for (const auto& operand : work.operands) result.push_back(&operand);
+    std::sort(result.begin(), result.end(), [](const auto* left, const auto* right) {
+        return std::tuple{left->kind, left->parameter.value, left->use.value} <
+               std::tuple{right->kind, right->parameter.value, right->use.value};
+    });
+    return result;
+}
+
 base::Digest256 InterfaceDigest(const semantic::ProgramInterface& value)
 {
     base::BinaryWriter writer;
     writer.WriteU32(value.vertexStrideBytes);
-    writer.WriteU32(static_cast<std::uint32_t>(value.vertexInputs.size()));
-    for (const auto& input : value.vertexInputs)
+    const auto vertexInputs = CanonicalVertexInputs(value);
+    writer.WriteU32(static_cast<std::uint32_t>(vertexInputs.size()));
+    for (const auto* input : vertexInputs)
     {
-        writer.WriteU16(static_cast<std::uint16_t>(input.meaning));
-        writer.WriteU16(input.componentCount);
-        writer.WriteU32(input.byteOffset);
+        writer.WriteU16(static_cast<std::uint16_t>(input->meaning));
+        writer.WriteU16(input->componentCount);
+        writer.WriteU32(input->byteOffset);
     }
-    writer.WriteU32(static_cast<std::uint32_t>(value.parameters.size()));
-    for (const auto& parameter : value.parameters)
+    const auto parameters = CanonicalParameters(value);
+    writer.WriteU32(static_cast<std::uint32_t>(parameters.size()));
+    for (const auto* parameter : parameters)
     {
-        writer.WriteU32(parameter.id.value);
-        writer.WriteU16(static_cast<std::uint16_t>(parameter.kind));
-        writer.WriteU16(static_cast<std::uint16_t>(parameter.stage));
-        writer.WriteU32(parameter.shaderRegister);
-        writer.WriteU64(parameter.requiredBytes);
-        writer.WriteU32(parameter.requiredAlignment);
+        writer.WriteU32(parameter->id.value);
+        writer.WriteU16(static_cast<std::uint16_t>(parameter->kind));
+        writer.WriteU16(static_cast<std::uint16_t>(parameter->stage));
+        writer.WriteU32(parameter->shaderRegister);
+        writer.WriteU64(parameter->requiredBytes);
+        writer.WriteU32(parameter->requiredAlignment);
     }
     return base::Sha256(writer.Bytes());
 }
@@ -1157,11 +1206,11 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
 
         const std::uint32_t rootCost = static_cast<std::uint32_t>(std::count_if(
             bindingOperands.begin(), bindingOperands.end(), [&](const auto* operand) {
-                return sourceProgram.interface.parameters[operand->parameter.value].kind ==
+                return FindParameter(sourceProgram.interface, operand->parameter)->kind ==
                        semantic::ProgramParameterKind::ConstantBuffer;
             })) * 2u + static_cast<std::uint32_t>(std::count_if(
             bindingOperands.begin(), bindingOperands.end(), [&](const auto* operand) {
-                return sourceProgram.interface.parameters[operand->parameter.value].kind !=
+                return FindParameter(sourceProgram.interface, operand->parameter)->kind !=
                        semantic::ProgramParameterKind::ConstantBuffer;
             }));
         if (rootCost > 64)
@@ -1176,7 +1225,10 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         {
             const auto* operand = bindingOperands[index];
             const auto* use = uses.at(operand->use.value);
-            const auto& sourceParameter = sourceProgram.interface.parameters[operand->parameter.value];
+            const auto* sourceParameterPointer = FindParameter(sourceProgram.interface, operand->parameter);
+            if (sourceParameterPointer == nullptr)
+                return Failure<LoweredPackageStage>("binding-layout", "validated ProgramParameter identity is missing");
+            const auto& sourceParameter = *sourceParameterPointer;
             pkg::RootParameterArtifact parameter;
             parameter.id = {static_cast<std::uint32_t>(description.rootParameters.size())};
             parameter.rootParameterIndex = index;
@@ -1255,15 +1307,15 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         if (work.kind == semantic::WorkKind::Raster)
         {
             const auto vertexFirst = static_cast<std::uint32_t>(description.vertexElements.size());
-            for (const auto& input : sourceProgram.interface.vertexInputs)
+            for (const auto* input : CanonicalVertexInputs(sourceProgram.interface))
             {
                 pkg::VertexElementArtifact element;
                 element.id = static_cast<std::uint32_t>(description.vertexElements.size());
-                element.meaning = static_cast<pkg::VertexMeaning>(input.meaning);
-                element.format = input.componentCount == 2 ? pkg::Format::R32G32Float :
-                                 input.componentCount == 3 ? pkg::Format::R32G32B32Float :
-                                                           pkg::Format::R32G32B32A32Float;
-                element.alignedByteOffset = input.byteOffset;
+                element.meaning = static_cast<pkg::VertexMeaning>(input->meaning);
+                element.format = input->componentCount == 2 ? pkg::Format::R32G32Float :
+                                 input->componentCount == 3 ? pkg::Format::R32G32B32Float :
+                                                            pkg::Format::R32G32B32A32Float;
+                element.alignedByteOffset = input->byteOffset;
                 description.vertexElements.push_back(element);
             }
 
@@ -1490,9 +1542,9 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     for (std::uint32_t position = 0; position < analyzed.canonicalWorkOrder.size(); ++position)
     {
         const auto& work = *works.at(analyzed.canonicalWorkOrder[position].value);
-        for (const auto& operand : work.operands)
+        for (const auto* operand : CanonicalOperands(work))
         {
-            const auto* use = uses.at(operand.use.value);
+            const auto* use = uses.at(operand->use.value);
             if (!externalSlots.contains(use->resource.value)) continue;
             if (!firstExternalUse.contains(use->resource.value))
             {
@@ -1565,9 +1617,10 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         for (const auto& [producerQueue, wait] : queueWaits)
             addOperation(pkg::D3D12OperationCode::WaitQueue, queue,
                          pkg::Encode(pkg::WaitQueuePayload{wait.second}));
-        for (const auto& operand : work.operands)
+        const auto canonicalOperands = CanonicalOperands(work);
+        for (const auto* operand : canonicalOperands)
         {
-            const auto* use = uses.at(operand.use.value);
+            const auto* use = uses.at(operand->use.value);
             const auto first = firstExternalUse.find(use->resource.value);
             if (first != firstExternalUse.end() && first->second == position)
                 addOperation(pkg::D3D12OperationCode::WaitExternal, queue,
@@ -1582,16 +1635,16 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         std::map<StateCell, const semantic::ResourceUse*> activeUses;
         std::set<std::uint32_t> rasterPresentationResources;
         if (work.kind == semantic::WorkKind::Raster)
-            for (const auto& operand : work.operands)
+            for (const auto* operand : canonicalOperands)
             {
-                const auto* use = uses.at(operand.use.value);
-                if (operand.kind == semantic::WorkOperandKind::PresentSource)
+                const auto* use = uses.at(operand->use.value);
+                if (operand->kind == semantic::WorkOperandKind::PresentSource)
                     rasterPresentationResources.insert(use->resource.value);
             }
 
-        for (const auto& operand : work.operands)
+        for (const auto* operand : canonicalOperands)
         {
-            const auto* use = uses.at(operand.use.value);
+            const auto* use = uses.at(operand->use.value);
             if (work.kind == semantic::WorkKind::Raster && use->role == semantic::ViewRole::PresentSource)
                 continue;
             const auto cell = cellFor(*use);
@@ -1607,12 +1660,12 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         {
             const semantic::ResourceUse* sourceUse = nullptr;
             const semantic::ResourceUse* destinationUse = nullptr;
-            for (const auto& operand : work.operands)
+            for (const auto* operand : canonicalOperands)
             {
-                if (operand.kind == semantic::WorkOperandKind::CopySource)
-                    sourceUse = uses.at(operand.use.value);
-                if (operand.kind == semantic::WorkOperandKind::CopyDestination)
-                    destinationUse = uses.at(operand.use.value);
+                if (operand->kind == semantic::WorkOperandKind::CopySource)
+                    sourceUse = uses.at(operand->use.value);
+                if (operand->kind == semantic::WorkOperandKind::CopyDestination)
+                    destinationUse = uses.at(operand->use.value);
             }
             if (sourceUse == nullptr || destinationUse == nullptr)
                 return Failure<LoweredPackageStage>("operation-lowering", "validated Copy Work has missing operands");
@@ -1629,10 +1682,10 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
         {
             addOperation(pkg::D3D12OperationCode::ExecuteRaster, queue,
                 pkg::Encode(pkg::ExecuteRasterPayload{workArtifacts.at(work.id.value).rasterCommand}));
-            for (const auto& operand : work.operands)
+            for (const auto* operand : canonicalOperands)
             {
-                const auto* use = uses.at(operand.use.value);
-                if (operand.kind != semantic::WorkOperandKind::PresentSource) continue;
+                const auto* use = uses.at(operand->use.value);
+                if (operand->kind != semantic::WorkOperandKind::PresentSource) continue;
                 const auto cell = cellFor(*use);
                 emitTransition(queue, viewMap.at(use->id.value), cell, Present());
                 activeUses[cell] = use;
@@ -1647,9 +1700,9 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
             for (std::uint32_t next = position + 1; next < analyzed.canonicalWorkOrder.size() && !nextFound; ++next)
             {
                 const auto& nextWork = *works.at(analyzed.canonicalWorkOrder[next].value);
-                for (const auto& nextOperand : nextWork.operands)
+                for (const auto* nextOperand : CanonicalOperands(nextWork))
                 {
-                    const auto* nextUse = uses.at(nextOperand.use.value);
+                    const auto* nextUse = uses.at(nextOperand->use.value);
                     if (cellFor(*nextUse) != cell) continue;
                     desired = workQueues.at(nextWork.id.value) == queue ? RequiredState(nextUse->role, nextWork.kind) : Common();
                     nextFound = true;

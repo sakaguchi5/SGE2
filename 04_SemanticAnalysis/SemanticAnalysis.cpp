@@ -247,12 +247,13 @@ void ValidateProgram(const Program& program, std::uint32_t source,
             Push(diagnostics, "vertex input layout exceeds or misaligns vertexStrideBytes", source);
     }
 
+    std::set<std::uint32_t> parameterIds;
     std::set<std::tuple<std::uint16_t, std::uint16_t, std::uint32_t>> registerKeys;
-    for (std::size_t index = 0; index < program.interface.parameters.size(); ++index)
+    for (const auto& parameter : program.interface.parameters)
     {
-        const auto& parameter = program.interface.parameters[index];
-        if (!parameter.id.IsValid() || parameter.id.value != index)
-            Push(diagnostics, "ProgramParameter IDs must be dense and ordered", source);
+        if (!parameter.id.IsValid() || parameter.id.value >= program.interface.parameters.size() ||
+            !parameterIds.insert(parameter.id.value).second)
+            Push(diagnostics, "ProgramParameter IDs must be unique and dense, but vector order is not semantic", source);
 
         const bool rasterStage = parameter.stage == ShaderStage::Vertex || parameter.stage == ShaderStage::Pixel;
         if ((program.kind == ProgramKind::Raster && !rasterStage) ||
@@ -374,6 +375,13 @@ bool ParameterRoleMatches(ProgramParameterKind kind, ViewRole role) noexcept
     }
 }
 
+const ProgramParameter* FindParameter(const Program& program, ProgramParameterId id) noexcept
+{
+    const auto found = std::find_if(program.interface.parameters.begin(), program.interface.parameters.end(),
+        [id](const ProgramParameter& parameter) { return parameter.id == id; });
+    return found == program.interface.parameters.end() ? nullptr : &*found;
+}
+
 std::uint16_t WorkStateClass(ViewRole role) noexcept
 {
     switch (role)
@@ -440,25 +448,24 @@ void ValidateWorkInterface(const Work& work, const Program* program,
         {
         case WorkOperandKind::ProgramParameter:
         {
-            if (program == nullptr || !operand.parameter.IsValid() ||
-                operand.parameter.value >= program->interface.parameters.size())
+            const auto* parameter = program == nullptr ? nullptr : FindParameter(*program, operand.parameter);
+            if (parameter == nullptr)
             {
                 Push(diagnostics, "ProgramParameter operand references an unknown parameter", source);
                 break;
             }
             if (!boundParameters.insert(operand.parameter.value).second)
                 Push(diagnostics, "ProgramParameter is bound more than once", source);
-            const auto& parameter = program->interface.parameters[operand.parameter.value];
-            if (!ParameterRoleMatches(parameter.kind, use->role))
+            if (!ParameterRoleMatches(parameter->kind, use->role))
                 Push(diagnostics, "ProgramParameter kind does not match ResourceUse role", source);
             else
             {
                 const auto resourceFound = resources.find(use->resource.value);
-                if (resourceFound != resources.end() && parameter.kind == ProgramParameterKind::ConstantBuffer)
+                if (resourceFound != resources.end() && parameter->kind == ProgramParameterKind::ConstantBuffer)
                 {
                     const auto* resource = resourceFound->second;
-                    if (resource->dynamicData.requiredBytes != parameter.requiredBytes ||
-                        resource->dynamicData.requiredAlignment < parameter.requiredAlignment)
+                    if (resource->dynamicData.requiredBytes != parameter->requiredBytes ||
+                        resource->dynamicData.requiredAlignment < parameter->requiredAlignment)
                         Push(diagnostics, "constant-buffer parameter size/alignment does not match the bound Resource", source);
                 }
             }
@@ -790,6 +797,42 @@ base::Result<AnalyzedGraph, std::vector<Diagnostic>> Analyze(const SemanticGraph
 
     if (!diagnostics.empty())
         return base::Result<AnalyzedGraph, std::vector<Diagnostic>>::Failure(std::move(diagnostics));
+
+    // Stage I canonical law: adding an explicit edge that is already implied by
+    // another path must not change the frozen execution plan.  A DAG has a
+    // unique transitive reduction, so retain only cover relations here.
+    auto reducedAdjacency = adjacency;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> adjacencyEdges;
+    for (const auto& [producer, consumers] : adjacency)
+        for (const auto consumer : consumers)
+            adjacencyEdges.push_back({producer, consumer});
+    for (const auto& [producer, consumer] : adjacencyEdges)
+    {
+        reducedAdjacency[producer].erase(consumer);
+        if (!HasPath(reducedAdjacency, producer, consumer))
+            reducedAdjacency[producer].insert(consumer);
+    }
+
+    std::map<std::pair<std::uint32_t, std::uint32_t>, DependencyEdge> reducedRecords;
+    const auto reasonKey = [](const DependencyEdge& edge) {
+        // A derived hazard is canonical evidence.  An optional explicit edge is
+        // used only when no derived relation exists for the cover relation.
+        return std::tuple{edge.kind == DependencyKind::Explicit ? 1u : 0u,
+                          static_cast<std::uint16_t>(edge.kind), edge.resource.value};
+    };
+    for (const auto& edge : dependencyRecords)
+    {
+        const auto foundProducer = reducedAdjacency.find(edge.producer.value);
+        if (foundProducer == reducedAdjacency.end() ||
+            !foundProducer->second.contains(edge.consumer.value))
+            continue;
+        const auto pair = std::pair{edge.producer.value, edge.consumer.value};
+        const auto found = reducedRecords.find(pair);
+        if (found == reducedRecords.end() || reasonKey(edge) < reasonKey(found->second))
+            reducedRecords[pair] = edge;
+    }
+    dependencyRecords.clear();
+    for (const auto& [pair, edge] : reducedRecords) dependencyRecords.push_back(edge);
 
     AnalyzedGraph output;
     output.source = &graph;

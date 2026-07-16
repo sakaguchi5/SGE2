@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <utility>
 
 namespace sge::semantic
@@ -300,11 +301,13 @@ namespace
 {
 bool ValidateParameterIds(const ProgramInterface& interfaceDescription)
 {
-    for (std::size_t index = 0; index < interfaceDescription.parameters.size(); ++index)
-        if (!interfaceDescription.parameters[index].id.IsValid() ||
-            interfaceDescription.parameters[index].id.value != index)
+    std::set<std::uint32_t> identities;
+    for (const auto& parameter : interfaceDescription.parameters)
+        if (!parameter.id.IsValid() ||
+            parameter.id.value >= interfaceDescription.parameters.size() ||
+            !identities.insert(parameter.id.value).second)
             return false;
-    return true;
+    return identities.size() == interfaceDescription.parameters.size();
 }
 }
 
@@ -316,7 +319,7 @@ base::Result<ProgramId, std::string> SemanticBuilder::AddRasterProgram(
     if (interfaceDescription.vertexInputs.empty() || interfaceDescription.vertexStrideBytes == 0)
         return base::Result<ProgramId, std::string>::Failure("raster program requires an explicit vertex interface");
     if (!ValidateParameterIds(interfaceDescription))
-        return base::Result<ProgramId, std::string>::Failure("raster program parameter IDs must be dense and ordered");
+        return base::Result<ProgramId, std::string>::Failure("raster program parameter IDs must be unique and dense");
     if (source.hlslSource.empty() || source.vertexEntry.empty() || source.pixelEntry.empty())
         return base::Result<ProgramId, std::string>::Failure("raster program source and entry points must be explicit compiler inputs");
     const auto id = NextId<ProgramId>(graph_.programs.size());
@@ -332,7 +335,7 @@ base::Result<ProgramId, std::string> SemanticBuilder::AddComputeProgram(
     if (!interfaceDescription.vertexInputs.empty() || interfaceDescription.vertexStrideBytes != 0)
         return base::Result<ProgramId, std::string>::Failure("compute program cannot declare a raster vertex interface");
     if (!ValidateParameterIds(interfaceDescription))
-        return base::Result<ProgramId, std::string>::Failure("compute program parameter IDs must be dense and ordered");
+        return base::Result<ProgramId, std::string>::Failure("compute program parameter IDs must be unique and dense");
     if (source.hlslSource.empty() || source.computeEntry.empty())
         return base::Result<ProgramId, std::string>::Failure("compute program source and entry point must be explicit compiler inputs");
     const auto id = NextId<ProgramId>(graph_.programs.size());
