@@ -1,0 +1,1321 @@
+現在のSGE2をレベル1とし、その後を「機能数」ではなく、**どこまで入力の形を限定せずに扱えるか**という一般化の深さで分けるのがよいです。
+
+大枠では、次の7段階が自然です。
+
+```text
+レベル1  特定実験を完全に固定できる
+レベル2  有限な一般Graphを正しくCompileできる
+レベル3  複数の正しい実行案から選択できる
+レベル4  Packageを分割・合成して動的世界を扱える
+レベル5  数学表現を保持したまま実行方式を選べる
+レベル6  大規模ゲームGPU基盤として利用できる
+レベル7  新しいGPU実行理論を探索・生成できる
+```
+
+重要なのは、レベルが上がってもレベル1を捨てないことです。レベル1は教材版や暫定版ではなく、以後の一般化が正しいかを比較する**基準モデル**になります。
+
+---
+
+# レベル1：特定実験に対する完全な垂直成立
+
+これが現在のSGE2です。
+
+## 現在できていること
+
+入力は強く限定されていますが、その限定された範囲では、
+
+```text
+Frontend
+  ↓
+Semantic Graph
+  ↓
+Analysis
+  ↓
+D3D12 Target Compiler
+  ↓
+Frozen Package
+  ↓
+Runtime
+  ↓
+D3D12 Executor
+```
+
+という全経路が成立しています。
+
+さらに、
+
+```text
+Raster
+Compute
+Copy
+複数Queue
+FrameLocal
+Temporal
+Aliasing
+External Resource
+Device loss
+Classical / SDF / PGA Frontend
+```
+
+まで境界を壊さず通過しています。
+
+Frozen Packageは、SourceやCompilerなしで読み込め、Device loss後にもPackage-owned objectを再物質化する契約を持ちます。これは設計憲法とABI仕様の中心条件です。fileciteturn2file0 fileciteturn2file1
+
+## 一般化されていない部分
+
+現在のCompilerは、任意Graphを扱うわけではありません。
+
+概念的には、
+
+```text
+このResource集合がある
+このWork順である
+このQueue構成である
+このdescriptor配置を使う
+このOperation列を生成する
+```
+
+というSlice 15の構造を知っています。
+
+したがって現在の正確な評価は、
+
+> 一つの複雑なGPU実験を、正しい責務分離で完全にCompileできる。
+
+です。
+
+まだ、
+
+> 任意のGPU実験をCompileできる。
+
+ではありません。
+
+## レベル1の成果物
+
+この段階は固定して残すべきです。
+
+```text
+SGE2 Level 1 Reference
+Slice 1～15
+Frozen Package Schema V1
+既知Graph専用Compiler
+全診断・Recovery test
+Classical/SDF/PGA等価性test
+```
+
+以後のレベルでは、この結果とPackage内容を比較できるようにします。
+
+---
+
+# レベル2：有限一般Semantic Graph Compiler
+
+ここが次に進むべき段階です。
+
+目的は、
+
+> Slice 15専用Compilerを、有限だが任意形状のGraphを扱えるCompilerへ変える。
+
+ことです。
+
+「有限一般」とは、無限に何でも扱うという意味ではありません。
+
+対応するResource、Work、Format、Shader種類は限定してよい一方で、その**個数と接続関係を固定しない**という意味です。
+
+---
+
+## 2A. Semantic Modelの一般化
+
+現在の固定的なPayload fieldを、一般的なProgram portやWork operandへ置き換えます。
+
+現在に近い構造：
+
+```text
+RasterPayload
+  vertexData
+  constantData
+  sampledTexture
+  computedData
+  copiedData
+  aliasedData
+  externalData
+```
+
+一般化後：
+
+```text
+Work
+  ProgramId
+  Inputs[]
+  Outputs[]
+  Attachments[]
+  Parameters[]
+```
+
+それぞれがResourceUseを参照します。
+
+```text
+WorkInput
+  parameterIdentity
+  resourceUse
+  expectedValueKind
+  role
+```
+
+これにより、後からTextureやBufferを一つ増やすたびに、C++構造体へ専用fieldを追加しなくて済みます。
+
+### レベル2で扱う範囲
+
+最初は次で十分です。
+
+```text
+Buffer
+Texture2D
+Surface
+Raster
+Compute
+Copy
+Present
+Persistent
+FrameLocal
+Temporal
+External
+```
+
+Texture3D、Ray tracing、Mesh Shaderなどはまだ不要です。
+
+重要なのは種類の多さではなく、任意個数の組合せを扱えることです。
+
+---
+
+## 2B. Analysisの一般化
+
+現在の既知Work順検証から、Graphアルゴリズムへ移ります。
+
+必要になるものは、
+
+```text
+ResourceUseから依存辺を生成
+Read-after-write
+Write-after-read
+Write-after-write
+Temporal edge
+External acquire edge
+Present edge
+循環検出
+Topological order
+```
+
+です。
+
+たとえば入力が、
+
+```text
+Work A: Texture Xを書く
+Work B: Texture Xを読む、Buffer Yを書く
+Work C: Buffer Yを読む
+```
+
+なら、Compilerが、
+
+```text
+A → B → C
+```
+
+を導きます。
+
+Workが増減しても、同じアルゴリズムで処理します。
+
+---
+
+## 2C. Resource instance planningの一般化
+
+Resourceごとに固定数を書くのではなく、Lifetime intentとframes in flightから物理数を計算します。
+
+例：
+
+```text
+Persistent
+  → 基本1 instance
+
+FrameLocal
+  → framesInFlight個
+
+Temporal previous/current
+  → temporal depthとframes in flightから計算
+
+External
+  → Package-owned instanceなし
+
+Surface
+  → Runtime-managed
+```
+
+ここで初めて、
+
+```text
+Resourceの意味
+  ↓
+Physical instance数
+```
+
+が一般アルゴリズムになります。
+
+---
+
+## 2D. AllocationとAliasingの一般化
+
+各Resourceの寿命区間を計算します。
+
+```text
+Resource A: operation 2～5
+Resource B: operation 6～9
+```
+
+同時に存在しないなら、同じAllocationを共有できる可能性があります。
+
+ただしレベル2では最適化を目指さず、
+
+```text
+安全にalias可能ならaliasする
+判断できなければ別allocation
+```
+
+でよいです。
+
+この段階の目的は、最高効率ではなく、正しい一般化です。
+
+---
+
+## 2E. State planningの一般化
+
+現在の固定Transition列から、
+
+```text
+ResourceUse
+  ↓
+要求State
+  ↓
+直前Stateとの比較
+  ↓
+Transition生成
+```
+
+へ移ります。
+
+たとえば、
+
+```text
+CopyDestination
+  ↓
+ShaderRead
+  ↓
+UnorderedWrite
+```
+
+という利用があれば、必要なTransitionをCompilerが生成します。
+
+Subresource単位までは、この段階で導入してもよいですが、最初はResource全体でも構いません。
+
+---
+
+## 2F. Queue planningの一般化
+
+レベル2では最適化はしません。
+
+次のような決定規則で十分です。
+
+```text
+Raster → Direct
+Copy → CopyがあればCopy、なければDirect
+Compute → ComputeがあればCompute、なければDirect
+Present → Direct
+```
+
+重要なのは、Work数や順番を固定せずに割当できることです。
+
+Queueを跨ぐ依存があれば、
+
+```text
+SignalQueue
+WaitQueue
+```
+
+を生成します。
+
+---
+
+## 2G. Binding Layoutの一般化
+
+Program Interfaceから、必要なdescriptor数とRoot Parameterを生成します。
+
+```text
+ConstantBuffer input
+Sampled Texture input
+Readonly Buffer input
+Writable Buffer output
+```
+
+を読み、
+
+```text
+CBV
+SRV
+UAV
+Root Parameter
+Descriptor range
+Shader register
+Descriptor index
+```
+
+を割り当てます。
+
+まだ最適なRoot Signatureを探す必要はありません。
+
+一意で決定的なcanonical layoutを生成できれば十分です。
+
+---
+
+## レベル2の完成条件
+
+次を満たせばレベル2です。
+
+```text
+Workを1個から任意個へ増減できる
+Resourceを任意個追加できる
+依存順をCompilerが導出する
+Queue割当をCompilerが導出する
+Viewとdescriptor数をCompilerが計算する
+Operation streamを入力Graphから生成する
+既存Slice 1～15を特殊分岐なしで再生成できる
+```
+
+特に重要なのは最後です。
+
+レベル1の固定Compilerと、レベル2の一般Compilerが、同じSlice 15入力から意味的に同じPackageを生成できることを確認します。
+
+---
+
+# レベル3：選択する最適化Compiler
+
+レベル2では、正しい実行を一つ生成します。
+
+レベル3では、
+
+> 複数の正しい実行案を作り、目的に応じて選ぶ。
+
+ところまで進みます。
+
+ここで初めて「Compilerが手段を選ぶ」という理念が完全な意味になります。
+
+---
+
+## 3A. 実行候補の生成
+
+同じSemantic Graphに対して、複数案を生成します。
+
+### Queue候補
+
+```text
+ComputeをDirectで実行
+Compute Queueへ分離
+CopyとComputeを並列化
+```
+
+### Allocation候補
+
+```text
+すべてCommitted
+Placed Resource
+Aliasingあり
+Memory節約優先
+```
+
+### frames in flight候補
+
+```text
+1 frame
+2 frames
+3 frames
+```
+
+### Executable候補
+
+```text
+Programを複数PSOへspecialize
+一部を共有
+```
+
+---
+
+## 3B. Cost model
+
+候補比較には評価軸が必要です。
+
+最初は静的な簡易モデルで構いません。
+
+```text
+Barrier数
+Queue handoff数
+Allocation bytes
+Descriptor数
+Physical instance数
+Upload bytes
+Operation数
+```
+
+たとえば、
+
+```text
+Score =
+  memoryWeight * allocationBytes
++ barrierWeight * barrierCount
++ handoffWeight * queueHandoffCount
+```
+
+のような形です。
+
+これは絶対的なGPU時間予測ではありません。
+
+しかし、選択の根拠を明示する第一歩になります。
+
+---
+
+## 3C. 目的関数
+
+人間は手段ではなく目的を指定します。
+
+```text
+Throughput優先
+Latency優先
+Memory優先
+Power優先
+Determinism優先
+Compile time優先
+```
+
+Target Policyへ目的を渡し、Compilerが候補を選びます。
+
+例：
+
+```text
+Memory優先
+  → Aliasingを積極利用
+  → frames in flightを抑える
+
+Latency優先
+  → Queue handoffを減らす
+  → Direct Queueへ集約
+
+Throughput優先
+  → Compute Queueを使う
+  → 複数frameを並行
+```
+
+---
+
+## 3D. 実測Feedback
+
+静的Cost modelだけでは限界があります。
+
+実行Packageに計測点を追加し、
+
+```text
+Queue時間
+Work時間
+Barrier周辺時間
+Memory使用量
+Frame latency
+```
+
+を取得します。
+
+その結果をCompilerへ戻し、同じSemantic Graphを再Compileします。
+
+```text
+Compile
+  ↓
+実行
+  ↓
+Profile
+  ↓
+別候補をCompile
+  ↓
+比較
+```
+
+ここでFrozen Packageの決定性が役立ちます。
+
+実行案AとBを、固定された成果物として公平に比較できます。
+
+---
+
+## レベル3の完成条件
+
+```text
+一つのSemantic Graphから複数Package候補を生成できる
+候補間の意味等価性を検証できる
+選択理由を診断として出せる
+目的関数を変えると別Packageを選択できる
+実測値を使って再選択できる
+```
+
+この段階でSGE2は、専用Compilerから**探索型GPU Compiler**へ進化します。
+
+---
+
+# レベル4：Package体系と動的実行
+
+レベル3までのPackageは、基本的に閉じた一つの実行単位です。
+
+レベル4では、大規模で動的な世界を扱うために、
+
+> 単一Packageから、複数Packageが協調する体系へ進む。
+
+必要があります。
+
+---
+
+## 4A. Package composition
+
+複数Packageを組み合わせます。
+
+```text
+Global package
+Shadow package
+Lighting package
+Character package
+Post-process package
+UI package
+```
+
+ただしRuntimeが場当たり的に連結してはいけません。
+
+Package間にも固定契約が必要です。
+
+```text
+Exported Resource
+Imported Resource
+Required incoming state
+Guaranteed outgoing state
+Completion dependency
+Device epoch
+Version compatibility
+```
+
+External slotを、Package間接続へ一般化するイメージです。
+
+---
+
+## 4B. Package Library
+
+共有されるものをPackage Libraryとして分離します。
+
+```text
+Shader Library
+Binding Layout Library
+Executable Library
+Static Resource Library
+```
+
+これにより、Scene fragmentごとに同じShader binaryやPSO記述を重複保存しなくて済みます。
+
+ただし、単独自立性とのバランスが必要です。
+
+次の二種類を明確に分けます。
+
+```text
+Standalone Package
+  → 単独実行可能
+
+Linked Package
+  → 特定Library Packageを要求
+```
+
+---
+
+## 4C. Incremental Compile
+
+Sceneの一部が変わったとき、全体を再Compileしないようにします。
+
+```text
+Material変更
+  → Material関連Packageだけ再Compile
+
+Area追加
+  → Scene fragmentを追加
+
+Shader変更
+  → 依存Executableだけ再Compile
+```
+
+そのためには、Semantic Graphの安定したidentityと依存digestが必要です。
+
+---
+
+## 4D. Streaming
+
+Streaming Resourceを正式な意味として追加します。
+
+```text
+Resourceは論理的には存在する
+内容は段階的に到着する
+一部Mipのみresident
+到着前はfallbackを使う
+不要時はevict可能
+```
+
+Packageは構造と契約を固定し、実際のresident状態はRuntimeが持ちます。
+
+```text
+Frozen contract
+  +
+Runtime residency state
+```
+
+です。
+
+Packageを書き換えてはいけません。
+
+---
+
+## 4E. 条件付き実行
+
+実ゲームでは、毎FrameすべてのWorkを実行しません。
+
+```text
+Shadow更新が必要な時だけ
+Reflection probeがdirtyな時だけ
+Visible objectがある時だけ
+```
+
+これをBackendのif文へ逃がさず、固定契約にします。
+
+例：
+
+```text
+Conditional Region
+  condition slot
+  true operation stream
+  false operation stream
+```
+
+またはPackage variantを選択します。
+
+---
+
+## 4F. GPU-generated work
+
+```text
+ExecuteIndirect
+DispatchIndirect
+GPU culling
+GPU-generated command
+```
+
+を扱います。
+
+CPU側のOperation数が固定でなくても、
+
+```text
+どのBufferがcommandを保持するか
+最大個数
+生成Work
+消費Work
+state
+synchronization
+```
+
+はPackageへ固定できます。
+
+---
+
+## レベル4の完成条件
+
+```text
+複数Packageを契約付きで接続できる
+共有Libraryを利用できる
+部分再Compileできる
+Streaming Resourceを扱える
+条件付き実行を表現できる
+GPU-driven workを扱える
+```
+
+この段階で、SGE2は小規模実験装置から、動的なRendering／GPU Compute基盤へ近づきます。
+
+---
+
+# レベル5：数学表現保持型Compiler
+
+レベル1のClassical、SDF、PGAは、途中で同じTriangleへ正規化されます。
+
+レベル5では、
+
+> 数学表現の違いを途中で消さず、Compilerの選択肢として保持する。
+
+ことを目指します。
+
+これはSGE2独自性が最も強く出る段階です。
+
+---
+
+## 5A. 二種類のLoweringを分離する
+
+### 表現消去Lowering
+
+現在の方式です。
+
+```text
+PGA
+  ↓
+Cartesian vertices
+  ↓
+共通Semantic Graph
+```
+
+比較基準として残します。
+
+### 表現保持Lowering
+
+```text
+PGA Motor
+PGA Point / Line / Plane relation
+SDF expression tree
+Classical mesh
+  ↓
+表現固有Semantic node
+```
+
+として残します。
+
+---
+
+## 5B. 高水準Semantic operation
+
+たとえばPGAなら、
+
+```text
+ApplyMotor
+Meet
+Join
+TransformLine
+GeneratePointSet
+```
+
+SDFなら、
+
+```text
+EvaluateDistance
+Union
+Intersection
+SmoothUnion
+Gradient
+RayMarch
+Polygonize
+```
+
+などです。
+
+これらをD3D12操作としてではなく、数学的意味としてSemanticへ置きます。
+
+---
+
+## 5C. 複数Lowering候補
+
+Compilerは同じ高水準意味から複数方式を生成します。
+
+PGA変換なら、
+
+```text
+CPUで頂点へ展開
+Compute Shaderで展開
+Vertex Shaderで直接評価
+PGA parameterをGPUへ渡して継続評価
+```
+
+SDFなら、
+
+```text
+事前polygonize
+GPU Computeでmesh生成
+Pixel Shaderでray march
+Voxelへ変換
+Hybrid
+```
+
+です。
+
+---
+
+## 5D. 等価性の定義
+
+Classical、SDF、PGAの出力は、必ずしもbyte単位一致しません。
+
+そこで、意味的等価性を定義します。
+
+```text
+同じ画像
+誤差ε以内
+同じsurface
+同じtopology
+同じvisibility結果
+同じcollision結果
+```
+
+目的ごとに観測関係を変えます。
+
+---
+
+## 5E. 数学的Cost model
+
+単純なGPU時間だけでなく、
+
+```text
+表現サイズ
+変換回数
+CPU→GPU転送量
+再構築量
+数値誤差
+幾何操作数
+表現共有率
+```
+
+を評価します。
+
+たとえばPGAがRaster単体では遅くても、
+
+```text
+Animation
+IK
+Constraint
+Geometry generation
+Collision
+```
+
+で同じ表現を共有できれば、全体として有利になる可能性があります。
+
+---
+
+## レベル5の完成条件
+
+```text
+PGA/SDFの構造がSemanticまで保持される
+同じ意味から複数Loweringを生成できる
+Classical pathと性能・誤差を比較できる
+数学表現の違いによってPackageが変わる
+Compilerが表現固有の利点を利用できる
+```
+
+この段階で初めて、
+
+> PGAやSDFがGPU実行に本当に有利か
+
+を公平に研究できます。
+
+---
+
+# レベル6：実ゲーム級GPU基盤
+
+レベル6では、SGE2を実際のゲームエンジン内で使える規模へ広げます。
+
+ただし、SGE2自体をゲームエンジン全体にはしません。
+
+役割は、
+
+> ゲームエンジン内のGPU目的CompilerとPackage Runtime
+
+です。
+
+---
+
+## 6A. 大規模Scene
+
+```text
+数万～数百万Resource
+多数のMaterial
+多数のView
+複数Camera
+Shadow cascade
+Reflection
+Post-process chain
+```
+
+を扱います。
+
+そのために必要なのは、
+
+```text
+Graph partition
+Parallel compile
+Package cache
+Incremental analysis
+Stable identity
+Memory budget
+```
+
+です。
+
+---
+
+## 6B. Asset systemとの接続
+
+Asset pipelineそのものをSGE2へ入れるのではなく、明確な境界を作ります。
+
+```text
+Asset system
+  ↓
+GPU-ready semantic asset
+  ↓
+SGE2 Compiler
+  ↓
+Package / Resource Library
+```
+
+File pathやsource assetをFrozen Packageへ混入させない原則は維持します。
+
+---
+
+## 6C. Shader ecosystem
+
+```text
+Shader variant
+Material parameter
+Bindless
+Mesh Shader
+Ray tracing
+Library linking
+Pipeline cache
+```
+
+を一般的Program Interfaceから扱います。
+
+---
+
+## 6D. Runtime品質
+
+製品級には次が必要です。
+
+```text
+Frame pacing
+Memory pressure対応
+Hot reload
+Background compile
+Package cache
+Fallback package
+Driver差異
+Recovery policy
+Telemetry
+```
+
+ただしCompilerとExecutorの責務境界は維持します。
+
+---
+
+## 6E. 複数GPU
+
+この段階で初めて本格的に扱うのが妥当です。
+
+```text
+Device identity
+Deviceごとのepoch
+Work affinity
+Resource replication
+Cross-adapter transfer
+Failure domain
+Present device
+```
+
+をTarget ModelとPackage Schemaへ追加します。
+
+---
+
+## レベル6の完成条件
+
+```text
+実ゲームScene規模を扱える
+Package compile時間が実用範囲
+Asset streamingと連携できる
+Shader/Materialの多数variantを扱える
+長時間実行とDevice recoveryが安定
+実ゲームのGPU処理全体をSGE2経由で実行できる
+```
+
+ここでようやく、既存ゲームエンジンのRendering基盤と実用面で比較できます。
+
+---
+
+# レベル7：新しいGPU実行理論の探索基盤
+
+これは最終段階であり、完成形を一つに決める段階ではありません。
+
+SGE2自身が、
+
+> 人間が知らない実行方法を探索する研究システム
+
+になります。
+
+---
+
+## 7A. 実行計画探索
+
+Compilerが、
+
+```text
+Queue partition
+Work fusion
+Work splitting
+Representation conversion
+Memory layout
+Precision
+Approximation
+```
+
+の組合せを探索します。
+
+候補数が大きいため、
+
+```text
+Constraint solving
+Integer programming
+Search
+Learning-based cost model
+Profile-guided optimization
+```
+
+などを使う可能性があります。
+
+---
+
+## 7B. 表現自体の選択
+
+Compilerは、実行方法だけでなく中間表現を選びます。
+
+```text
+Mesh
+SDF
+PGA
+Voxel
+Procedural
+Hybrid
+```
+
+を目的とTargetに応じて切り替えます。
+
+例：
+
+```text
+近距離
+  → Classical mesh
+
+遠距離
+  → SDF / Impostor
+
+変形部分
+  → PGA parameter
+
+Collision
+  → SDF
+
+最終Raster
+  → generated mesh
+```
+
+これを人間が固定せず、Compilerが選択します。
+
+---
+
+## 7C. 誤差と性能の共同最適化
+
+完全一致だけでなく、
+
+```text
+許容誤差
+知覚品質
+時間予算
+Memory予算
+Energy予算
+```
+
+を同時に扱います。
+
+人間は、
+
+```text
+画面上の誤差は1 pixel以内
+frame timeは16.6ms以内
+memoryは4GB以内
+```
+
+のように目的と制約を書きます。
+
+Compilerが実行方法と数学表現を選びます。
+
+---
+
+## 7D. 新しい数学表現の導入
+
+Frontendを追加するだけでなく、
+
+```text
+既存表現では効率が悪い意味領域
+```
+
+を見つけ、新しい数学的道具を設計します。
+
+ここではSGE2が単なるエンジンではなく、
+
+> 数学表現とGPU executionの対応を研究する実験機
+
+になります。
+
+---
+
+## レベル7の完成条件
+
+明確な「完成」はありません。
+
+評価基準は、
+
+```text
+人間が手段を書かずに済む範囲が増えたか
+Compilerが有効な新実行案を発見できたか
+既存方式より理論的または実測的に優れたか
+新しい数学表現が実行上の意味を持ったか
+```
+
+です。
+
+---
+
+# 分野別のレベル対応表
+
+| 分野 | レベル1 | レベル2 | レベル3 | レベル4 | レベル5 | レベル6 | レベル7 |
+|---|---|---|---|---|---|---|---|
+| Semantic Model | 特定実験型 | 任意有限Graph | 最適化制約 | 動的・条件付き | 数学表現保持 | 実ゲーム規模 | 新表現を許容 |
+| Analysis | 既知構造検証 | 一般依存解析 | 候補生成 | 分割・差分解析 | 表現横断解析 | 並列・増分解析 | 探索・制約解法 |
+| Queue | 固定配置 | 規則的自動配置 | Costで選択 | Package間同期 | 表現別配置 | 複数GPU | 自動探索 |
+| Resource | 固定集合 | 任意有限集合 | 配置候補比較 | Streaming・共有 | 数学表現資源 | 大規模budget | 自動表現変換 |
+| Allocation | 固定 | 一般安全配置 | Memory最適化 | Library共有 | 表現別layout | 製品級residency | 探索最適化 |
+| Binding | 固定layout | Interfaceから生成 | Layout候補比較 | Library化 | 表現固有binding | Bindless等 | 自動interface設計 |
+| Package | 単一完結 | 一般Graph Package | 複数候補 | 合成・Library | 表現別variant | 大規模配布 | 実行探索成果物 |
+| Runtime | 単一Package | 一般Package | Profile収集 | 動的構成 | 表現variant選択 | ゲーム統合 | 適応実行 |
+| Frontend | Classical/SDF/PGA→共通Triangle | 複数一般Frontend | Policy供給 | 動的asset連携 | 表現保持 | Production tool連携 | 新数学研究 |
+| Executor | 固定Operation解釈 | 一般Operation解釈 | 計測対応 | 複数Package | 表現非依存維持 | 製品堅牢性 | 機械的写像を維持 |
+
+---
+
+# 現実的な次の進行順
+
+すぐにレベル2全体を一度に作るのではなく、内部をさらに段階化した方が安全です。
+
+```text
+Level 1
+現在のSlice 15
+
+Level 1.1
+固定ID・固定resource countを除去
+
+Level 1.2
+任意個数のResourceとViewをPackage化
+
+Level 1.3
+任意個数のWorkを依存順に並べる
+
+Level 1.4
+ResourceUseからStateを自動生成
+
+Level 1.5
+Queue割当とhandoffを自動生成
+
+Level 1.6
+AllocationとAliasingを一般化
+
+Level 1.7
+Program InterfaceからBinding Layoutを生成
+
+Level 2
+既存Slice 1～15を特殊分岐なしで再生成
+```
+
+このLevel 1.1～1.7は、従来のSlice 16以後と呼ばない方がよいかもしれません。
+
+従来のSliceは機能領域を広げる縦断試験でした。
+
+ここからは、
+
+> 既に成立した縦断試験から、固定前提を一つずつ除去する一般化試験
+
+だからです。
+
+名称としては、
+
+```text
+Generalization Stage 1
+Generalization Stage 2
+...
+```
+
+または、
+
+```text
+G1 Resource cardinality
+G2 Work graph
+G3 State planning
+G4 Queue planning
+G5 Allocation planning
+G6 Binding synthesis
+G7 Generic package lowering
+```
+
+の方が意味に合います。
+
+---
+
+# 最終整理
+
+現在のレベル1は、決して低い段階ではありません。
+
+一般的なゲームエンジンの機能数では小さいですが、アーキテクチャ検証としてはかなり深いところまで来ています。
+
+```text
+レベル1:
+特定の複雑な実行を、正しい境界で完全固定できる。
+
+レベル2:
+任意の有限Graphを、正しい実行へCompileできる。
+
+レベル3:
+複数の正しい実行から、目的に合うものを選べる。
+
+レベル4:
+複数Packageと動的状態を扱える。
+
+レベル5:
+数学表現を保持し、実行方法として活用できる。
+
+レベル6:
+実ゲーム規模で利用できる。
+
+レベル7:
+新しい表現と実行方式を探索できる。
+```
+
+SGE2の核心的な飛躍は、レベル6の製品化ではありません。
+
+最大の理論的飛躍は、
+
+```text
+レベル1 → レベル2
+```
+
+と、
+
+```text
+レベル4 → レベル5
+```
+
+です。
+
+前者では「特定実験専用Compiler」から「一般GPU Compiler」になります。
+
+後者では「異なる表現を共通形へ変換するCompiler」から、「異なる数学表現そのものを実行選択に利用するCompiler」になります。
+
+この二つが、今後のSGE2全体を決める本当の分水嶺です。
