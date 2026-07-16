@@ -46,7 +46,7 @@ std::shared_ptr<sge::runtime::ICompletionToken> ReleaseToken(
 }
 
 sge::base::Result<k::Float4, std::string> Execute(
-    const k::Input& input, const l3::ExecutionPlanIR& plan, bool recover)
+    const k::Input& input, const l3::verification::VerifiedExecutionPlan& plan, bool recover)
 {
     auto compiled = compiler::CompileSelectedPlan(input.graph, input.targetProfile, plan);
     if (!compiled) return sge::base::Result<k::Float4, std::string>::Failure(
@@ -116,13 +116,13 @@ int main()
     bool recovered = false;
     for (const auto& plan : plans)
     {
-        const auto report = l3::verification::Verify(obligation.Value(), contract, plan);
-        if (!report.verified) continue;
+        auto sealed = l3::verification::VerifyAndSeal(obligation.Value(), contract, plan);
+        if (!sealed) continue;
         scheduleAlternative |= plan.scheduleStrategy != l3::ScheduleStrategy::CanonicalMinimumId;
         allDirect |= plan.queueStrategy == l3::QueueStrategy::AllDirect;
         dedicated |= plan.queueStrategy == l3::QueueStrategy::CanonicalSafe ||
                      plan.queueStrategy == l3::QueueStrategy::KindPreferredDedicated;
-        auto observed = Execute(input, plan, !recovered);
+        auto observed = Execute(input, sealed.Value(), !recovered);
         if (!observed)
         {
             std::cerr << "verified Plan execution failed: " << observed.Error() << '\n';

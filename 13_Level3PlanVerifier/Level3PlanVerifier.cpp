@@ -32,6 +32,11 @@ bool QueueCanExecute(semantic::WorkKind kind, QueueClass queueClass)
     return queueClass == QueueClass::Direct || queueClass == QueueClass::Copy;
 }
 
+bool SameQueue(const WorkQueueAssignment& left, const WorkQueueAssignment& right)
+{
+    return left.queueClass == right.queueClass && left.queueIndex == right.queueIndex;
+}
+
 // Deliberately duplicated from neither Planner nor Package lowering. This is
 // the verifier's independent D3D12 v1 state oracle.
 AbstractState ExpectedState(semantic::ViewRole role, semantic::WorkKind workKind)
@@ -112,6 +117,15 @@ VerificationReport Verify(const SemanticObligation& obligation,
                 edge.consumer.value);
             continue;
         }
+        if (edge.signalPoint != producer->second)
+            Add(report, DiagnosticCode::InvalidSynchronization, "synchronization",
+                "SignalPoint is not the canonical producer schedule position", edge.producer.value);
+        const auto producerQueue = assignments.find(edge.producer.value);
+        const auto consumerQueue = assignments.find(edge.consumer.value);
+        if (producerQueue != assignments.end() && consumerQueue != assignments.end() &&
+            SameQueue(producerQueue->second, consumerQueue->second))
+            Add(report, DiagnosticCode::InvalidSynchronization, "synchronization",
+                "same-Queue Works must not carry an explicit Signal/Wait edge", edge.consumer.value);
         const auto existing = producerSignals.find(edge.producer.value);
         if (existing != producerSignals.end() && existing->second != edge.signalPoint)
             Add(report, DiagnosticCode::InvalidSynchronization, "synchronization", "one producer uses multiple SignalPoints",
@@ -126,8 +140,7 @@ VerificationReport Verify(const SemanticObligation& obligation,
         const auto producerQueue = assignments.find(dependency.producer.value);
         const auto consumerQueue = assignments.find(dependency.consumer.value);
         if (producerQueue == assignments.end() || consumerQueue == assignments.end()) continue;
-        const bool sameQueue = producerQueue->second.queueClass == consumerQueue->second.queueClass &&
-                               producerQueue->second.queueIndex == consumerQueue->second.queueIndex;
+        const bool sameQueue = SameQueue(producerQueue->second, consumerQueue->second);
         if (!sameQueue && !synchronized.contains({dependency.producer.value, dependency.consumer.value}))
             Add(report, DiagnosticCode::MissingSynchronization, "synchronization", "cross-Queue dependency has no Signal/Wait edge",
                 dependency.consumer.value, dependency.resource.value);
@@ -175,6 +188,7 @@ VerificationReport Verify(const SemanticObligation& obligation,
 
     std::map<std::uint32_t, const AllocationPlan*> allocations;
     std::map<std::uint32_t, std::uint32_t> allocationCoverage;
+    std::map<std::uint32_t, std::uint32_t> allocationForResource;
     for (const auto& allocation : plan.allocations)
     {
         if (allocation.id == base::InvalidIndex || !allocations.emplace(allocation.id, &allocation).second)
@@ -197,13 +211,21 @@ VerificationReport Verify(const SemanticObligation& obligation,
                     base::InvalidIndex, resourceId.value);
                 continue;
             }
+            allocationForResource[resourceId.value] = allocation.id;
             const auto& resource = *resources.at(resourceId.value);
             if (resource.lifetime == semantic::LifetimeIntent::External || resource.kind == semantic::ResourceKind::SurfaceImage)
                 Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation", "External or Surface Resource is Package allocated",
                     base::InvalidIndex, resourceId.value);
             requiredSize = std::max(requiredSize, resource.sizeBytes);
             const auto resourcePlan = resourcePlans.find(resourceId.value);
-            if (resourcePlan != resourcePlans.end()) requiredInstances = std::max(requiredInstances, resourcePlan->second.physicalInstanceCount);
+            if (resourcePlan != resourcePlans.end())
+            {
+                requiredInstances = std::max(requiredInstances, resourcePlan->second.physicalInstanceCount);
+                if (resourcePlan->second.allocation != allocation.id)
+                    Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation",
+                        "Resource instance Allocation reference does not name the covering Allocation",
+                        base::InvalidIndex, resourceId.value);
+            }
         }
         if (allocation.sizeBytes < requiredSize || allocation.physicalInstanceCount != requiredInstances)
             Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation", "Allocation size or instance coverage is insufficient");
@@ -232,9 +254,19 @@ VerificationReport Verify(const SemanticObligation& obligation,
         const auto planFound = resourcePlans.find(id);
         if (planFound != resourcePlans.end())
         {
-            const auto expected = packageOwned ? allocationCoverage[id] : 0u;
-            if ((planFound->second.allocation != base::InvalidIndex) != (expected != 0))
-                Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation", "Resource Allocation reference disagrees with coverage", base::InvalidIndex, id);
+            if (packageOwned)
+            {
+                const auto covering = allocationForResource.find(id);
+                if (covering == allocationForResource.end() || planFound->second.allocation != covering->second)
+                    Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation",
+                        "Resource Allocation reference and Allocation coverage are not bidirectionally identical",
+                        base::InvalidIndex, id);
+            }
+            else if (planFound->second.allocation != base::InvalidIndex)
+            {
+                Add(report, DiagnosticCode::AllocationCoverageViolation, "allocation",
+                    "non-Package Resource carries an Allocation reference", base::InvalidIndex, id);
+            }
         }
     }
 
@@ -249,15 +281,50 @@ VerificationReport Verify(const SemanticObligation& obligation,
     for (const auto& [id, use] : uses)
         if (!states.contains(id)) Add(report, DiagnosticCode::StatePlanViolation, "state", "ResourceUse has no state plan", use->owner.value, use->resource.value, id);
 
-    std::set<std::pair<std::uint32_t, std::uint32_t>> requiredBindings;
-    for (const auto& parameter : obligation.parameters) requiredBindings.emplace(parameter.program.value, parameter.id.value);
-    std::set<std::pair<std::uint32_t, std::uint32_t>> actualBindings;
+    using BindingKey = std::pair<std::uint32_t, std::uint32_t>;
+    std::map<BindingKey, const BindingPlan*> actualBindings;
     for (const auto& binding : plan.bindings)
-        if (!actualBindings.emplace(binding.program.value, binding.parameter.value).second ||
-            !requiredBindings.contains({binding.program.value, binding.parameter.value}))
-            Add(report, DiagnosticCode::BindingPlanViolation, "binding", "unknown or duplicate binding plan");
-    if (actualBindings != requiredBindings)
-        Add(report, DiagnosticCode::BindingPlanViolation, "binding", "binding plan is incomplete");
+    {
+        const BindingKey key{binding.program.value, binding.parameter.value};
+        if (!actualBindings.emplace(key, &binding).second)
+            Add(report, DiagnosticCode::BindingPlanViolation, "binding", "duplicate binding plan");
+    }
+    std::set<BindingKey> requiredBindings;
+    std::uint32_t expectedRoot = 0;
+    std::uint32_t expectedDescriptor = 0;
+    std::uint32_t previousProgram = base::InvalidIndex;
+    for (const auto& parameter : obligation.parameters)
+    {
+        const BindingKey key{parameter.program.value, parameter.id.value};
+        requiredBindings.insert(key);
+        if (parameter.program.value != previousProgram)
+        {
+            previousProgram = parameter.program.value;
+            expectedRoot = 0;
+        }
+        const auto found = actualBindings.find(key);
+        if (found == actualBindings.end())
+        {
+            Add(report, DiagnosticCode::BindingPlanViolation, "binding", "binding plan is incomplete");
+            ++expectedRoot;
+            if (parameter.kind != semantic::ProgramParameterKind::ConstantBuffer) ++expectedDescriptor;
+            continue;
+        }
+        const auto& binding = *found->second;
+        if (binding.rootParameterIndex != expectedRoot)
+            Add(report, DiagnosticCode::BindingPlanViolation, "binding",
+                "rootParameterIndex is not the canonical Program-local index");
+        const bool descriptorBacked = parameter.kind != semantic::ProgramParameterKind::ConstantBuffer;
+        const auto requiredDescriptor = descriptorBacked ? expectedDescriptor : base::InvalidIndex;
+        if (binding.descriptorIndex != requiredDescriptor)
+            Add(report, DiagnosticCode::BindingPlanViolation, "binding",
+                "descriptorIndex is not the canonical Level 3 v1 binding index");
+        ++expectedRoot;
+        if (descriptorBacked) ++expectedDescriptor;
+    }
+    for (const auto& [key, binding] : actualBindings)
+        if (!requiredBindings.contains(key))
+            Add(report, DiagnosticCode::BindingPlanViolation, "binding", "binding plan references an unknown ProgramParameter");
 
     std::vector<semantic::ResourceId> expectedExternal;
     std::vector<semantic::ResourceId> expectedPresent;
@@ -276,5 +343,16 @@ VerificationReport Verify(const SemanticObligation& obligation,
 
     report.verified = report.violations.empty();
     return report;
+}
+
+base::Result<VerifiedExecutionPlan, VerificationReport> VerifyAndSeal(
+    const SemanticObligation& obligation,
+    const D3D12PlanningContract& contract,
+    const ExecutionPlanIR& plan)
+{
+    auto report = Verify(obligation, contract, plan);
+    if (!report.verified)
+        return base::Result<VerifiedExecutionPlan, VerificationReport>::Failure(std::move(report));
+    return base::Result<VerifiedExecutionPlan, VerificationReport>::Success(VerifiedExecutionPlan(plan));
 }
 }

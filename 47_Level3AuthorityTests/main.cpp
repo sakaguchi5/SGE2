@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,12 +86,12 @@ sge::base::Result<Fixture, std::string> BuildFixture()
     fixture.contract = l3::BuildPlanningContract(fixture.input.targetProfile);
     fixture.safePlan = l3c::BuildCanonicalSafePlan(fixture.obligation, fixture.contract);
 
-    const auto report = verify::Verify(fixture.obligation, fixture.contract, fixture.safePlan);
-    if (!report.verified) return sge::base::Result<Fixture, std::string>::Failure(
+    auto sealed = verify::VerifyAndSeal(fixture.obligation, fixture.contract, fixture.safePlan);
+    if (!sealed) return sge::base::Result<Fixture, std::string>::Failure(
         "CanonicalSafePlan was rejected by the independent verifier");
 
     auto package = compiler::CompileSelectedPlan(
-        fixture.input.graph, fixture.input.targetProfile, fixture.safePlan);
+        fixture.input.graph, fixture.input.targetProfile, sealed.Value());
     if (!package) return sge::base::Result<Fixture, std::string>::Failure(
         package.Error().stage + ": " + package.Error().message);
     fixture.safePackage = std::move(package).Value();
@@ -108,8 +109,14 @@ void RequireRejectedOrFrozen(TestLog& log, const Fixture& fixture, std::string_v
         return;
     }
 
+    auto sealed = verify::VerifyAndSeal(fixture.obligation, fixture.contract, mutated);
+    if (!sealed)
+    {
+        log.Fail(name, "Verify and VerifyAndSeal disagreed for the same Plan");
+        return;
+    }
     auto package = compiler::CompileSelectedPlan(
-        fixture.input.graph, fixture.input.targetProfile, mutated);
+        fixture.input.graph, fixture.input.targetProfile, sealed.Value());
     if (!package)
     {
         log.Fail(name, "Verifier accepted the Plan, but selected-Plan lowering rejected it");
@@ -125,19 +132,19 @@ void RequireRejectedOrFrozen(TestLog& log, const Fixture& fixture, std::string_v
 
 void CheckVerifierGate(TestLog& log, const Fixture& fixture)
 {
+    constexpr bool rawPlanCanReachLowering = std::is_invocable_v<
+        decltype(&compiler::CompileSelectedPlan),
+        const sge::semantic::SemanticGraph&,
+        const sge::target::D3D12TargetProfile&,
+        const l3::ExecutionPlanIR&>;
+    log.Require(!rawPlanCanReachLowering, "raw-plan-lowering-requires-verifier",
+        "CompileSelectedPlan still accepts raw ExecutionPlanIR instead of VerifiedExecutionPlan");
+
     auto corrupted = fixture.safePlan;
     corrupted.identity[0] ^= std::byte{0x01};
-    const auto report = verify::Verify(fixture.obligation, fixture.contract, corrupted);
-    if (report.verified)
-    {
-        log.Fail("raw-plan-lowering-requires-verifier", "identity-corrupted Plan unexpectedly passed verification");
-        return;
-    }
-
-    const auto lowered = compiler::CompileSelectedPlan(
-        fixture.input.graph, fixture.input.targetProfile, corrupted);
-    log.Require(!lowered, "raw-plan-lowering-requires-verifier",
-        "CompileSelectedPlan accepted a Plan that the independent verifier rejected");
+    log.Require(!verify::VerifyAndSeal(fixture.obligation, fixture.contract, corrupted),
+        "verifier-seal-rejects-corrupt-identity",
+        "VerifyAndSeal created a capability token for a rejected Plan");
 }
 
 void CheckBindingAuthority(TestLog& log, const Fixture& fixture)

@@ -4,6 +4,7 @@
 #include "../00_Base/Sha256.h"
 #include "../04_SemanticAnalysis/SemanticAnalysis.h"
 #include "../07_FrozenPackageCore/PackageReader.h"
+#include "../13_Level3PlanVerifier/Level3PlanVerifier.h"
 #include "../08_D3D12PackageSchema/D3D12Encoding.h"
 
 #ifndef NOMINMAX
@@ -1834,13 +1835,14 @@ base::Result<CompileOutput, CompileError> Compile(
 base::Result<CompileOutput, CompileError> CompileSelectedPlan(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile,
-    const level3::ExecutionPlanIR& selectedPlan)
+    const level3::verification::VerifiedExecutionPlan& selectedPlan)
 {
     auto validated = ValidateSourceStage(graph, targetProfile);
     if (!validated) return base::Result<CompileOutput, CompileError>::Failure(validated.Error());
     auto programs = CompileProgramStage(validated.Value());
     if (!programs) return base::Result<CompileOutput, CompileError>::Failure(programs.Error());
-    auto lowered = LowerPackageStage(validated.Value(), programs.Value(), &selectedPlan);
+    const auto& plan = selectedPlan.Plan();
+    auto lowered = LowerPackageStage(validated.Value(), programs.Value(), &plan);
     if (!lowered) return base::Result<CompileOutput, CompileError>::Failure(lowered.Error());
     auto frozen = FreezePackageStage(std::move(lowered).Value());
     if (frozen)

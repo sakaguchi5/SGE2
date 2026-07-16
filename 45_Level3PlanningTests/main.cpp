@@ -167,15 +167,16 @@ int CheckCanonicalCompatibility(const std::vector<Case>& corpus)
         }
         const auto contract = l3::BuildPlanningContract(item.profile);
         const auto safe = l3c::BuildCanonicalSafePlan(obligation.Value(), contract);
-        const auto report = verify::Verify(obligation.Value(), contract, safe);
-        if (!report.verified)
+        auto sealed = verify::VerifyAndSeal(obligation.Value(), contract, safe);
+        if (!sealed)
         {
+            const auto& report = sealed.Error();
             std::cerr << item.name << ": CanonicalSafe verifier rejected with "
                       << report.violations.size() << " diagnostics\n";
             if (!report.violations.empty()) std::cerr << report.violations.front().message << '\n';
             return 3;
         }
-        auto newPackage = compiler::CompileSelectedPlan(item.graph, item.profile, safe);
+        auto newPackage = compiler::CompileSelectedPlan(item.graph, item.profile, sealed.Value());
         if (!newPackage)
         {
             std::cerr << item.name << ": selected Plan lowering failed at "
@@ -355,8 +356,15 @@ int CheckAllocationCandidates(const Case& item)
         std::cerr << "Schema-17-compatible allocation candidates are missing\n";
         return 27;
     }
-    auto aliasPackage = compiler::CompileSelectedPlan(item.graph, item.profile, *alias);
-    auto committedPackage = compiler::CompileSelectedPlan(item.graph, item.profile, *committed);
+    auto sealedAlias = verify::VerifyAndSeal(obligation.Value(), contract, *alias);
+    auto sealedCommitted = verify::VerifyAndSeal(obligation.Value(), contract, *committed);
+    if (!sealedAlias || !sealedCommitted)
+    {
+        std::cerr << "Schema-17-compatible allocation candidates could not be sealed\n";
+        return 27;
+    }
+    auto aliasPackage = compiler::CompileSelectedPlan(item.graph, item.profile, sealedAlias.Value());
+    auto committedPackage = compiler::CompileSelectedPlan(item.graph, item.profile, sealedCommitted.Value());
     const auto aliasCost = l3c::CalculateCost(obligation.Value(), *alias);
     const auto committedCost = l3c::CalculateCost(obligation.Value(), *committed);
     if (!aliasPackage || !committedPackage ||
@@ -388,10 +396,10 @@ sge::base::Result<ManifestText, std::string> BuildFreezeManifest(const std::vect
         if (!obligation) return sge::base::Result<ManifestText, std::string>::Failure(item.name + ": obligation failed");
         const auto contract = l3::BuildPlanningContract(item.profile);
         const auto safe = l3c::BuildCanonicalSafePlan(obligation.Value(), contract);
-        const auto report = verify::Verify(obligation.Value(), contract, safe);
-        if (!report.verified) return sge::base::Result<ManifestText, std::string>::Failure(item.name + ": safe Plan rejected");
+        auto sealed = verify::VerifyAndSeal(obligation.Value(), contract, safe);
+        if (!sealed) return sge::base::Result<ManifestText, std::string>::Failure(item.name + ": safe Plan rejected");
         auto oldPackage = compiler::Compile(item.graph, item.profile);
-        auto newPackage = compiler::CompileSelectedPlan(item.graph, item.profile, safe);
+        auto newPackage = compiler::CompileSelectedPlan(item.graph, item.profile, sealed.Value());
         if (!oldPackage || !newPackage || oldPackage.Value().packageBytes != newPackage.Value().packageBytes)
             return sge::base::Result<ManifestText, std::string>::Failure(item.name + ": Level 2 bytes changed");
         output << "case=" << item.name

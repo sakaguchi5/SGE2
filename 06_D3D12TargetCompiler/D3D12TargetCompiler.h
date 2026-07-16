@@ -26,6 +26,11 @@
 #include <string>
 #include <vector>
 
+namespace sge::level3::verification
+{
+class VerifiedExecutionPlan;
+}
+
 namespace sge::compiler::d3d12
 {
 struct CompileError final
@@ -111,11 +116,10 @@ struct CompileOutput final
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile);
 
-// Level 3 lowering entry. The caller must pass a plan accepted by the
-// independent Level3PlanVerifier. This function performs no candidate
-// generation or policy selection; it only materializes the selected plan.
+// Level 3 lowering entry. The verifier-sealed type is the capability token:
+// raw ExecutionPlanIR values cannot reach Package lowering.
 [[nodiscard]] base::Result<CompileOutput, CompileError> CompileSelectedPlan(
     const semantic::SemanticGraph& graph,
     const target::D3D12TargetProfile& targetProfile,
-    const level3::ExecutionPlanIR& selectedPlan);
+    const level3::verification::VerifiedExecutionPlan& selectedPlan);
 }

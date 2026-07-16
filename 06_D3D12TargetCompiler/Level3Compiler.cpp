@@ -506,11 +506,12 @@ base::Result<Level3CompileOutput, CompileError> CompileLevel3(
     {
         CandidateRecord record;
         record.plan = std::move(plan);
-        record.verification = level3::verification::Verify(obligation, contract, record.plan);
+        auto sealed = level3::verification::VerifyAndSeal(obligation, contract, record.plan);
+        record.verification = sealed ? level3::verification::VerificationReport{true, {}} : sealed.Error();
         record.cost = CalculateCost(obligation, record.plan);
-        if (record.verification.verified && verifiedCount < policy.budget.maxVerifiedCandidates)
+        if (sealed && verifiedCount < policy.budget.maxVerifiedCandidates)
         {
-            auto package = CompileSelectedPlan(graph, targetProfile, record.plan);
+            auto package = CompileSelectedPlan(graph, targetProfile, sealed.Value());
             if (!package) return base::Result<Level3CompileOutput, CompileError>::Failure(package.Error());
             record.packageExecutionDigestHex = package.Value().executionDigestHex;
             packages.push_back(std::move(package).Value());
