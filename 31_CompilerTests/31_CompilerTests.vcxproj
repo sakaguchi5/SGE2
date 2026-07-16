@@ -129,6 +129,10 @@
       <Project>{BA1EB255-65D0-51B9-9CB9-3109B6287BB4}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
+    <ProjectReference Include="..\25_Level2Scenarios\25_Level2Scenarios.vcxproj">
+      <Project>{58C1861F-C41B-499A-8C30-961A14A38F8B}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
     <ProjectReference Include="..\23_ExperimentDomain\23_ExperimentDomain.vcxproj">
       <Project>{7B4235CA-D02B-53DF-8050-579E81061227}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>

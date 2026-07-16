@@ -4,6 +4,7 @@
 #include "../07_FrozenPackageCore/PackageReader.h"
 #include "../08_D3D12PackageSchema/D3D12Encoding.h"
 #include "../20_ClassicalFrontend/ClassicalTriangle.h"
+#include "../25_Level2Scenarios/Level2Scenarios.h"
 
 #include <algorithm>
 #include <exception>
@@ -181,6 +182,47 @@ std::uint32_t Count(std::span<const pkg::OperationView> operations, pkg::D3D12Op
     }));
 }
 
+
+
+sem::SemanticGraph PermuteStageHTopLevelTables(sem::SemanticGraph graph)
+{
+    std::reverse(graph.resources.begin(), graph.resources.end());
+    std::rotate(graph.resourceUses.begin(),
+        graph.resourceUses.begin() + (graph.resourceUses.empty() ? 0 : 1),
+        graph.resourceUses.end());
+    std::reverse(graph.programs.begin(), graph.programs.end());
+    std::rotate(graph.works.begin(),
+        graph.works.begin() + (graph.works.empty() ? 0 : 1),
+        graph.works.end());
+    return graph;
+}
+
+bool MatchesExecutionOrder(
+    std::span<const pkg::OperationView> operations,
+    const std::vector<sge::level2::ExpectedExecution>& expected)
+{
+    std::vector<sge::level2::ExpectedExecution> actual;
+    for (const auto& operation : operations)
+    {
+        sem::WorkKind kind{};
+        if (operation.opcode == pkg::D3D12OperationCode::ExecuteRaster)
+            kind = sem::WorkKind::Raster;
+        else if (operation.opcode == pkg::D3D12OperationCode::ExecuteCompute)
+            kind = sem::WorkKind::Compute;
+        else if (operation.opcode == pkg::D3D12OperationCode::ExecuteCopy)
+            kind = sem::WorkKind::Copy;
+        else
+            continue;
+        actual.push_back({kind, operation.queue.value});
+    }
+    if (actual.size() != expected.size()) return false;
+    for (std::size_t index = 0; index < actual.size(); ++index)
+        if (actual[index].kind != expected[index].kind ||
+            actual[index].queue != expected[index].queue)
+            return false;
+    return true;
+}
+
 bool ValidateSignalIdentityContract(std::span<const pkg::OperationView> operations)
 {
     std::map<std::uint32_t, std::pair<std::uint32_t, std::size_t>> signals;
@@ -230,6 +272,120 @@ bool ValidateSignalIdentityContract(std::span<const pkg::OperationView> operatio
     }
     return true;
 }
+
+int ValidateStageHScenario(sge::level2::StageHScenario key)
+{
+    auto built = sge::level2::BuildStageHScenario(key);
+    if (!built)
+    {
+        std::cerr << "Stage-H scenario construction failed: " << built.Error() << '\n';
+        return 1;
+    }
+    auto input = std::move(built).Value();
+    if (input.graph.resources.size() != input.expectations.resourceCount ||
+        input.graph.resourceUses.size() != input.expectations.resourceUseCount ||
+        input.graph.programs.size() != input.expectations.sourceProgramCount)
+    {
+        std::cerr << input.name << ": Source graph cardinality mismatch\n";
+        return 2;
+    }
+
+    auto analyzed = sge::analysis::Analyze(input.graph);
+    if (!analyzed)
+    {
+        std::cerr << input.name << ": Semantic analysis rejected the graph\n";
+        return 3;
+    }
+    if (analyzed.Value().canonicalWorkOrder != input.expectations.canonicalWorkOrder)
+    {
+        std::cerr << input.name << ": canonical Work order was not derived from dependencies\n";
+        return 4;
+    }
+
+    auto first = sge::compiler::d3d12::Compile(input.graph, input.targetProfile);
+    auto second = sge::compiler::d3d12::Compile(input.graph, input.targetProfile);
+    if (!first || !second)
+    {
+        const auto& error = !first ? first.Error() : second.Error();
+        std::cerr << input.name << ": Compile failed at " << error.stage
+                  << ": " << error.message << '\n';
+        return 5;
+    }
+    if (first.Value().packageBytes != second.Value().packageBytes ||
+        first.Value().executionDigestHex != second.Value().executionDigestHex)
+    {
+        std::cerr << input.name << ": repeated Compile was not byte deterministic\n";
+        return 6;
+    }
+
+    auto permutedGraph = PermuteStageHTopLevelTables(input.graph);
+    auto permuted = sge::compiler::d3d12::Compile(permutedGraph, input.targetProfile);
+    if (!permuted || permuted.Value().packageBytes != first.Value().packageBytes)
+    {
+        if (!permuted)
+            std::cerr << input.name << ": permuted Compile failed at "
+                      << permuted.Error().stage << ": " << permuted.Error().message << '\n';
+        else
+            std::cerr << input.name << ": Package bytes depend on top-level vector order\n";
+        return 7;
+    }
+
+    auto frozen = sge::package::PackageReader::Read(first.Value().packageBytes);
+    if (!frozen)
+    {
+        std::cerr << input.name << ": PackageReader failed: " << frozen.Error().message << '\n';
+        return 8;
+    }
+    auto decoded = pkg::D3D12PackageView::Decode(frozen.Value());
+    if (!decoded)
+    {
+        std::cerr << input.name << ": Package decode failed: " << decoded.Error().message << '\n';
+        return 9;
+    }
+    const auto& view = decoded.Value();
+    const auto rasterWorks = static_cast<std::size_t>(std::count_if(
+        input.graph.works.begin(), input.graph.works.end(), [](const auto& work) {
+            return work.kind == sem::WorkKind::Raster;
+        }));
+    const auto computeWorks = static_cast<std::size_t>(std::count_if(
+        input.graph.works.begin(), input.graph.works.end(), [](const auto& work) {
+            return work.kind == sem::WorkKind::Compute;
+        }));
+    if (view.Resources().size() != input.expectations.resourceCount ||
+        view.Views().size() != input.expectations.resourceUseCount ||
+        view.Shaders().size() != input.expectations.shaderCount ||
+        view.Programs().size() != rasterWorks + computeWorks ||
+        view.BindingLayouts().size() != rasterWorks + computeWorks ||
+        view.Executables().size() != rasterWorks ||
+        view.RasterCommands().size() != rasterWorks ||
+        view.ComputeExecutables().size() != computeWorks ||
+        view.ComputeCommands().size() != computeWorks)
+    {
+        std::cerr << input.name << ": Package artifact cardinality mismatch\n";
+        return 10;
+    }
+
+    const auto& frame = view.FrameOperations();
+    if (!MatchesExecutionOrder(frame, input.expectations.executionOrder) ||
+        Count(frame, pkg::D3D12OperationCode::WaitQueue) != input.expectations.waitQueueCount ||
+        Count(frame, pkg::D3D12OperationCode::SignalQueue) !=
+            input.graph.works.size() + (input.expectations.surface ? 1u : 0u) ||
+        Count(frame, pkg::D3D12OperationCode::PresentSurface) !=
+            (input.expectations.surface ? 1u : 0u) ||
+        view.SurfaceSlots().size() != (input.expectations.surface ? 1u : 0u) ||
+        (view.Profile().surfaceImageCount != 0) != input.expectations.surface)
+    {
+        std::cerr << input.name << ": Package operation topology mismatch\n";
+        return 11;
+    }
+    if (!ValidateSignalIdentityContract(frame))
+    {
+        std::cerr << input.name << ": Signal identity contract is invalid\n";
+        return 12;
+    }
+    return 0;
+}
+
 }
 
 int main()
@@ -544,6 +700,10 @@ int main()
         return 38;
     }
 
-    std::cout << "Stage-F explicit signal identity, Temporal/External boundary ABI, Stage-E typed pipeline, reflection, and generic Package lowering tests passed.\n";
+    for (const auto scenario : sge::level2::StageHInputs())
+        if (const auto result = ValidateStageHScenario(scenario); result != 0)
+            return 100 + result;
+
+    std::cout << "Stage-H non-historical Graph compilation, Stage-F explicit signal identity, Stage-E typed pipeline, reflection, and generic Package lowering tests passed.\n";
     return 0;
 }

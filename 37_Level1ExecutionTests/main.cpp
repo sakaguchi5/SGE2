@@ -4,6 +4,7 @@
 #include "../10_D3D12Executor/D3D12Executor.h"
 #include "../11_PlatformWin32/Win32Window.h"
 #include "../24_Level1Scenarios/Level1Scenarios.h"
+#include "../25_Level2Scenarios/Level2Scenarios.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 namespace
 {
 namespace lvl = sge::level1;
+namespace lvl2 = sge::level2;
 
 constexpr std::array<float, 16> Identity = {
     1.0f, 0.0f, 0.0f, 0.0f,
@@ -333,6 +335,153 @@ int ValidateSurfaceHostRequirement()
     return 0;
 }
 
+
+
+int ValidateStageHSubmission(
+    const lvl2::StageHInput& input,
+    const sge::runtime::FrameSubmission& submission,
+    std::uint64_t frameNumber,
+    std::uint64_t expectedEpoch)
+{
+    if (submission.deviceEpoch != expectedEpoch ||
+        submission.framesInFlight != input.targetProfile.framesInFlight ||
+        submission.frameSlot != frameNumber % input.targetProfile.framesInFlight)
+    {
+        std::cerr << input.name << ": submission identity metadata mismatch\n";
+        return 1;
+    }
+
+    const std::uint32_t directQueue = 0;
+    const std::uint32_t computeQueue = input.targetProfile.directQueueCount;
+    const std::uint32_t copyQueue = input.targetProfile.directQueueCount +
+                                    input.targetProfile.computeQueueCount;
+    const bool direct = HasQueueCompletion(submission, directQueue);
+    const bool compute = input.targetProfile.computeQueueCount != 0 &&
+                         HasQueueCompletion(submission, computeQueue);
+    const bool copy = input.targetProfile.copyQueueCount != 0 &&
+                      HasQueueCompletion(submission, copyQueue);
+    const auto expectedQueueCount = static_cast<std::size_t>(
+        input.expectations.directCompletion) +
+        static_cast<std::size_t>(input.expectations.computeCompletion) +
+        static_cast<std::size_t>(input.expectations.copyCompletion);
+    if (direct != input.expectations.directCompletion ||
+        compute != input.expectations.computeCompletion ||
+        copy != input.expectations.copyCompletion ||
+        submission.queues.size() != expectedQueueCount)
+    {
+        std::cerr << input.name << ": queue completion topology mismatch\n";
+        return 2;
+    }
+    if (frameNumber >= input.targetProfile.framesInFlight &&
+        submission.reusedSlotFenceValue == 0)
+    {
+        std::cerr << input.name << ": frame-slot reuse had no Package queue dependency\n";
+        return 3;
+    }
+    if (submission.temporalDependencyFenceValue != 0 ||
+        !submission.releasedExternalResources.empty())
+    {
+        std::cerr << input.name << ": unexpected Temporal or External runtime output\n";
+        return 4;
+    }
+    return 0;
+}
+
+int ExecuteStageHScenario(
+    lvl2::StageHScenario key,
+    sge::runtime::ISurfaceHost& surface)
+{
+    auto built = lvl2::BuildStageHScenario(key);
+    if (!built)
+    {
+        std::cerr << "Stage-H scenario construction failed: " << built.Error() << '\n';
+        return 1;
+    }
+    auto input = std::move(built).Value();
+    auto compiled = sge::compiler::d3d12::Compile(input.graph, input.targetProfile);
+    if (!compiled)
+    {
+        std::cerr << input.name << ": Compile failed at " << compiled.Error().stage
+                  << ": " << compiled.Error().message << '\n';
+        return 2;
+    }
+    auto package = sge::package::PackageReader::Read(
+        std::move(compiled).Value().packageBytes);
+    if (!package)
+    {
+        std::cerr << input.name << ": PackageReader failed: "
+                  << package.Error().message << '\n';
+        return 3;
+    }
+
+    sge::d3d12::D3D12Executor executor({true, true});
+    auto loaded = input.expectations.surface
+        ? sge::runtime::LoadPackage(std::move(package).Value(), executor, surface)
+        : sge::runtime::LoadPackage(std::move(package).Value(), executor);
+    if (!loaded)
+    {
+        std::cerr << input.name << ": Load failed at " << loaded.Error().stage
+                  << ": " << loaded.Error().message << '\n';
+        return 4;
+    }
+
+    sge::runtime::FrameInvocation invocation;
+    for (std::uint64_t frameNumber = 0; frameNumber < 3; ++frameNumber)
+    {
+        invocation.frameNumber = frameNumber;
+        auto submitted = sge::runtime::Submit(loaded.Value(), executor, invocation);
+        if (!submitted)
+        {
+            std::cerr << input.name << ": frame " << frameNumber
+                      << " Submit failed at " << submitted.Error().stage
+                      << ": " << submitted.Error().message << '\n';
+            return 5;
+        }
+        if (const auto validation = ValidateStageHSubmission(
+                input, submitted.Value(), frameNumber, 1);
+            validation != 0)
+            return 10 + validation;
+    }
+
+    auto rebuilt = sge::runtime::RecoverDevice(
+        loaded.Value(), executor,
+        sge::runtime::DeviceRecoveryMode::ControlledRebuild);
+    if (!rebuilt)
+    {
+        std::cerr << input.name << ": Controlled reconstruction failed at "
+                  << rebuilt.Error().stage << ": " << rebuilt.Error().message << '\n';
+        return 20;
+    }
+    const auto& report = rebuilt.Value();
+    if (report.previousDeviceEpoch != 1 || report.newDeviceEpoch != 2 ||
+        report.stateBefore != sge::runtime::DeviceRuntimeState::Active ||
+        report.stateAfter != sge::runtime::DeviceRuntimeState::Active ||
+        !report.adapterReacquired || !report.packageObjectsRebuilt ||
+        !report.temporalHistoryReset || report.externalRebindRequired)
+    {
+        std::cerr << input.name << ": Controlled reconstruction report mismatch\n";
+        return 21;
+    }
+
+    invocation.frameNumber = 0;
+    auto resubmitted = sge::runtime::Submit(loaded.Value(), executor, invocation);
+    if (!resubmitted)
+    {
+        std::cerr << input.name << ": post-recovery Submit failed at "
+                  << resubmitted.Error().stage << ": "
+                  << resubmitted.Error().message << '\n';
+        return 22;
+    }
+    if (const auto validation = ValidateStageHSubmission(
+            input, resubmitted.Value(), 0, 2);
+        validation != 0)
+        return 30 + validation;
+
+    std::cout << "  Stage-H executed: " << input.name << '\n';
+    return 0;
+}
+
+
 int ExecuteScenario(
     lvl::ScenarioKey key,
     sge::runtime::ISurfaceHost& surface)
@@ -492,12 +641,19 @@ int main()
         return 30 + surfaceContract;
 
     auto window = sge::platform::Win32Window::Create(
-        L"SGE2 Level-1 Stage-B WARP Qualification", 96, 96);
+        L"SGE2 Stage-B/G/H WARP Qualification", 96, 96);
     if (!window)
     {
         std::cerr << "Stage-B window creation failed: " << window.Error() << '\n';
         return 1;
     }
+
+    for (const auto key : lvl2::StageHInputs())
+    {
+        const auto result = ExecuteStageHScenario(key, *window.Value());
+        if (result != 0) return 60 + result;
+    }
+    std::cout << "Stage-H non-historical Graph qualification passed: 3 Packages compiled, executed, and reconstructed.\n";
 
     for (const auto key : lvl::StageAInputs())
     {
@@ -505,6 +661,6 @@ int main()
         if (result != 0) return 100 + result;
     }
 
-    std::cout << "Slice 1-15 Stage-B execution and Stage-G headless Runtime qualification passed.\n";
+    std::cout << "Slice 1-15 Stage-B execution plus Stage-G headless and Stage-H non-historical Runtime qualification passed.\n";
     return 0;
 }

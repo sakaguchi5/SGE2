@@ -36,6 +36,8 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "23_ExperimentDomain", "23_E
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "24_Level1Scenarios", "24_Level1Scenarios\24_Level1Scenarios.vcxproj", "{C8B5E0C8-5C1B-4D4A-9C82-4E9E53E8A124}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "25_Level2Scenarios", "25_Level2Scenarios\25_Level2Scenarios.vcxproj", "{58C1861F-C41B-499A-8C30-961A14A38F8B}"
+EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "30_SemanticTests", "30_SemanticTests\30_SemanticTests.vcxproj", "{78E06D68-D46E-5229-BE08-E3BC9C7D2912}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "31_CompilerTests", "31_CompilerTests\31_CompilerTests.vcxproj", "{099F5488-1F7A-5EA6-A551-B5DA1A13EE02}"
@@ -126,6 +128,10 @@ Global
 		{7B4235CA-D02B-53DF-8050-579E81061227}.Debug|x64.Build.0 = Debug|x64
 		{7B4235CA-D02B-53DF-8050-579E81061227}.Release|x64.ActiveCfg = Release|x64
 		{7B4235CA-D02B-53DF-8050-579E81061227}.Release|x64.Build.0 = Release|x64
+		{58C1861F-C41B-499A-8C30-961A14A38F8B}.Debug|x64.ActiveCfg = Debug|x64
+		{58C1861F-C41B-499A-8C30-961A14A38F8B}.Debug|x64.Build.0 = Debug|x64
+		{58C1861F-C41B-499A-8C30-961A14A38F8B}.Release|x64.ActiveCfg = Release|x64
+		{58C1861F-C41B-499A-8C30-961A14A38F8B}.Release|x64.Build.0 = Release|x64
 		{78E06D68-D46E-5229-BE08-E3BC9C7D2912}.Debug|x64.ActiveCfg = Debug|x64
 		{78E06D68-D46E-5229-BE08-E3BC9C7D2912}.Debug|x64.Build.0 = Debug|x64
 		{78E06D68-D46E-5229-BE08-E3BC9C7D2912}.Release|x64.ActiveCfg = Release|x64
