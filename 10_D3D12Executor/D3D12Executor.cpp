@@ -3027,37 +3027,6 @@ base::Result<ExternalBufferBinding, runtime::RuntimeError> D3D12Executor::Create
 
 bool D3D12Executor::SupportsOperation(pkg::D3D12OperationCode code) noexcept
 {
-    switch (code)
-    {
-    case pkg::D3D12OperationCode::CreateDescriptorHeaps:
-    case pkg::D3D12OperationCode::CreateResource:
-    case pkg::D3D12OperationCode::UploadBuffer:
-    case pkg::D3D12OperationCode::CreateRootSignature:
-    case pkg::D3D12OperationCode::CreateGraphicsPipeline:
-    case pkg::D3D12OperationCode::CreateComputePipeline:
-    case pkg::D3D12OperationCode::InitializeState:
-    case pkg::D3D12OperationCode::VerifyBufferContents:
-    case pkg::D3D12OperationCode::UploadTexture:
-    case pkg::D3D12OperationCode::VerifyTextureContents:
-    case pkg::D3D12OperationCode::AcquireSurfaceImage:
-    case pkg::D3D12OperationCode::AcquireExternal:
-    case pkg::D3D12OperationCode::WaitExternal:
-    case pkg::D3D12OperationCode::ApplyDynamicData:
-    case pkg::D3D12OperationCode::BeginQueueBatch:
-    case pkg::D3D12OperationCode::Transition:
-    case pkg::D3D12OperationCode::ActivateAlias:
-    case pkg::D3D12OperationCode::ExecuteRaster:
-    case pkg::D3D12OperationCode::ExecuteCompute:
-    case pkg::D3D12OperationCode::ExecuteCopy:
-    case pkg::D3D12OperationCode::EndQueueBatch:
-    case pkg::D3D12OperationCode::SignalQueue:
-    case pkg::D3D12OperationCode::WaitQueue:
-    case pkg::D3D12OperationCode::WaitTemporal:
-    case pkg::D3D12OperationCode::ReleaseExternal:
-    case pkg::D3D12OperationCode::PresentSurface:
-        return true;
-    default:
-        return false;
-    }
+    return pkg::IsKnownOperation(code);
 }
 }

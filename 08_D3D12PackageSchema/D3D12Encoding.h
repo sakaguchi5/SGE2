@@ -8,6 +8,16 @@
 
 namespace sge::package::d3d12_v13
 {
+struct OperationContract final
+{
+    D3D12OperationCode code{};
+    std::uint16_t version = 0;
+};
+
+[[nodiscard]] std::span<const OperationContract> OperationContracts() noexcept;
+[[nodiscard]] std::uint16_t OperationVersion(D3D12OperationCode code) noexcept;
+[[nodiscard]] bool IsKnownOperation(D3D12OperationCode code) noexcept;
+
 [[nodiscard]] base::Result<std::vector<std::byte>, PackageError> BuildFrozenPackage(
     const D3D12PackageDescription& description);
 

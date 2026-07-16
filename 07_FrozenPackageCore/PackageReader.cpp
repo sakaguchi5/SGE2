@@ -117,6 +117,12 @@ base::Result<PackageHeader, PackageError> ReadHeader(std::span<const std::byte> 
         return base::Result<PackageHeader, PackageError>::Failure(Error(PackageErrorCode::WrongEndianness, "package is not little endian"));
     if (header.digestAlgorithm != DigestAlgorithmSha256)
         return base::Result<PackageHeader, PackageError>::Failure(Error(PackageErrorCode::UnsupportedContainerVersion, "unsupported digest algorithm"));
+    if (header.flags != 0)
+        return base::Result<PackageHeader, PackageError>::Failure(Error(PackageErrorCode::UnsupportedContainerVersion, "package header contains unsupported flags"));
+    if (header.sectionCount == 0 ||
+        static_cast<std::uint64_t>(header.sectionCount) >
+            (bytes.size() - HeaderBytes) / SectionDescriptorBytes)
+        return base::Result<PackageHeader, PackageError>::Failure(Error(PackageErrorCode::InvalidSectionTable, "section count is invalid for the file size"));
     if (header.fileBytes != bytes.size())
         return base::Result<PackageHeader, PackageError>::Failure(Error(PackageErrorCode::FileSizeMismatch, "header fileBytes does not match the actual file size"));
     if (header.sectionTableOffset != HeaderBytes)
@@ -155,6 +161,17 @@ base::Result<std::vector<SectionDescriptor>, PackageError> ReadDescriptors(
 
         if (descriptor.descriptorBytes != SectionDescriptorBytes)
             return base::Result<std::vector<SectionDescriptor>, PackageError>::Failure(Error(PackageErrorCode::UnsupportedContainerVersion, "section descriptor size mismatch", descriptor.sectionKind));
+        constexpr std::uint32_t KnownSectionFlags =
+            static_cast<std::uint32_t>(SectionFlags::Required) |
+            static_cast<std::uint32_t>(SectionFlags::ExecutionAffecting) |
+            static_cast<std::uint32_t>(SectionFlags::DebugOnly) |
+            static_cast<std::uint32_t>(SectionFlags::OpaqueToCore);
+        if ((descriptor.flags & ~KnownSectionFlags) != 0 ||
+            (HasFlag(descriptor.flags, SectionFlags::DebugOnly) &&
+             HasFlag(descriptor.flags, SectionFlags::ExecutionAffecting)))
+            return base::Result<std::vector<SectionDescriptor>, PackageError>::Failure(Error(PackageErrorCode::UnsupportedContainerVersion, "section contains unsupported or contradictory flags", descriptor.sectionKind));
+        if (IsKnownSectionKind(descriptor.sectionKind) && descriptor.schemaVersion != 1)
+            return base::Result<std::vector<SectionDescriptor>, PackageError>::Failure(Error(PackageErrorCode::UnsupportedContainerVersion, "known section schema version is unsupported", descriptor.sectionKind));
         if (HasFlag(descriptor.flags, SectionFlags::Required) && !IsKnownSectionKind(descriptor.sectionKind))
             return base::Result<std::vector<SectionDescriptor>, PackageError>::Failure(Error(PackageErrorCode::UnknownRequiredSection, "unknown required section", descriptor.sectionKind));
         if (descriptor.fileOffset < tableEnd)

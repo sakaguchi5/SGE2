@@ -6,10 +6,12 @@
 #include "../07_FrozenPackageCore/PackageWriter.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -40,6 +42,35 @@ constexpr std::uint32_t ExternalSlotStride = 48;
 constexpr std::uint32_t SurfaceSlotStride = 32;
 constexpr std::uint32_t OperationStreamStride = 16;
 constexpr std::uint32_t OperationStride = 24;
+
+constexpr std::array OperationContractTable = {
+    OperationContract{D3D12OperationCode::CreateDescriptorHeaps, 1},
+    OperationContract{D3D12OperationCode::CreateResource, 1},
+    OperationContract{D3D12OperationCode::UploadBuffer, 1},
+    OperationContract{D3D12OperationCode::CreateRootSignature, 1},
+    OperationContract{D3D12OperationCode::CreateGraphicsPipeline, 1},
+    OperationContract{D3D12OperationCode::InitializeState, 1},
+    OperationContract{D3D12OperationCode::VerifyBufferContents, 1},
+    OperationContract{D3D12OperationCode::UploadTexture, 1},
+    OperationContract{D3D12OperationCode::VerifyTextureContents, 1},
+    OperationContract{D3D12OperationCode::CreateComputePipeline, 1},
+    OperationContract{D3D12OperationCode::AcquireSurfaceImage, 1},
+    OperationContract{D3D12OperationCode::AcquireExternal, 1},
+    OperationContract{D3D12OperationCode::WaitExternal, 1},
+    OperationContract{D3D12OperationCode::ApplyDynamicData, 1},
+    OperationContract{D3D12OperationCode::BeginQueueBatch, 1},
+    OperationContract{D3D12OperationCode::Transition, 1},
+    OperationContract{D3D12OperationCode::ActivateAlias, 1},
+    OperationContract{D3D12OperationCode::ExecuteRaster, 1},
+    OperationContract{D3D12OperationCode::ExecuteCompute, 1},
+    OperationContract{D3D12OperationCode::ExecuteCopy, 2},
+    OperationContract{D3D12OperationCode::EndQueueBatch, 1},
+    OperationContract{D3D12OperationCode::SignalQueue, 2},
+    OperationContract{D3D12OperationCode::WaitQueue, 2},
+    OperationContract{D3D12OperationCode::WaitTemporal, 2},
+    OperationContract{D3D12OperationCode::ReleaseExternal, 2},
+    OperationContract{D3D12OperationCode::PresentSurface, 1},
+};
 
 PackageError Error(PackageErrorCode code, std::string message, SectionKind section = {})
 {
@@ -76,6 +107,25 @@ base::Result<ResourceState, PackageError> ReadState(base::BinaryReader& reader, 
         return base::Result<ResourceState, PackageError>::Failure(Error(PackageErrorCode::InvalidEnumValue, "resource state class is unknown", section));
     if (state.stateClass != StateClass::Explicit && state.explicitBits != 0)
         return base::Result<ResourceState, PackageError>::Failure(Error(PackageErrorCode::InvalidEnumValue, "non-explicit state contains explicit bits", section));
+    if (state.stateClass == StateClass::Explicit)
+    {
+        constexpr std::uint32_t KnownExplicitBits =
+            static_cast<std::uint32_t>(ExplicitStateBits::VertexBuffer) |
+            static_cast<std::uint32_t>(ExplicitStateBits::ConstantBuffer) |
+            static_cast<std::uint32_t>(ExplicitStateBits::IndexBuffer) |
+            static_cast<std::uint32_t>(ExplicitStateBits::RenderTarget) |
+            static_cast<std::uint32_t>(ExplicitStateBits::DepthWrite) |
+            static_cast<std::uint32_t>(ExplicitStateBits::DepthRead) |
+            static_cast<std::uint32_t>(ExplicitStateBits::ShaderRead) |
+            static_cast<std::uint32_t>(ExplicitStateBits::UnorderedWrite) |
+            static_cast<std::uint32_t>(ExplicitStateBits::CopySource) |
+            static_cast<std::uint32_t>(ExplicitStateBits::CopyDestination) |
+            static_cast<std::uint32_t>(ExplicitStateBits::IndirectArgument) |
+            static_cast<std::uint32_t>(ExplicitStateBits::PixelShaderRead) |
+            static_cast<std::uint32_t>(ExplicitStateBits::NonPixelShaderRead);
+        if (state.explicitBits == 0 || (state.explicitBits & ~KnownExplicitBits) != 0)
+            return base::Result<ResourceState, PackageError>::Failure(Error(PackageErrorCode::InvalidEnumValue, "explicit state bits are empty or unknown", section));
+    }
     return base::Result<ResourceState, PackageError>::Success(state);
 }
 
@@ -352,7 +402,10 @@ base::Result<TargetProfile, PackageError> DecodeProfileRecord(base::BinaryReader
 
     const auto queueCount = static_cast<std::uint64_t>(profile.directQueueCount) +
                             profile.computeQueueCount + profile.copyQueueCount;
-    if (profile.framesInFlight == 0 || profile.directQueueCount == 0 || queueCount > 64 ||
+    if (profile.framesInFlight == 0 || profile.directQueueCount != 1 ||
+        profile.computeQueueCount > 1 || profile.copyQueueCount > 1 || queueCount > 3 ||
+        profile.samplerDescriptorCount != 0 || profile.requiredFeatureBits0 != 0 ||
+        profile.requiredFeatureBits1 != 0 ||
         profile.barrierModel != BarrierModel::Legacy ||
         profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc ||
         profile.shaderModelMajor != 5 || profile.shaderModelMinor > 1 ||
@@ -896,57 +949,6 @@ base::Result<RawOperation, PackageError> DecodeOperation(base::BinaryReader& rea
     return base::Result<RawOperation, PackageError>::Success(value);
 }
 
-std::uint16_t ExpectedOperationVersion(D3D12OperationCode code)
-{
-    switch (code)
-    {
-    case D3D12OperationCode::SignalQueue:
-    case D3D12OperationCode::WaitQueue:
-    case D3D12OperationCode::WaitTemporal:
-    case D3D12OperationCode::ReleaseExternal:
-    case D3D12OperationCode::ExecuteCopy:
-        return 2;
-    default:
-        return 1;
-    }
-}
-
-bool KnownOpcode(D3D12OperationCode code)
-{
-    switch (code)
-    {
-    case D3D12OperationCode::CreateDescriptorHeaps:
-    case D3D12OperationCode::CreateResource:
-    case D3D12OperationCode::UploadBuffer:
-    case D3D12OperationCode::CreateRootSignature:
-    case D3D12OperationCode::CreateGraphicsPipeline:
-    case D3D12OperationCode::CreateComputePipeline:
-    case D3D12OperationCode::InitializeState:
-    case D3D12OperationCode::VerifyBufferContents:
-    case D3D12OperationCode::UploadTexture:
-    case D3D12OperationCode::VerifyTextureContents:
-    case D3D12OperationCode::AcquireSurfaceImage:
-    case D3D12OperationCode::AcquireExternal:
-    case D3D12OperationCode::WaitExternal:
-    case D3D12OperationCode::ApplyDynamicData:
-    case D3D12OperationCode::BeginQueueBatch:
-    case D3D12OperationCode::Transition:
-    case D3D12OperationCode::ActivateAlias:
-    case D3D12OperationCode::ExecuteRaster:
-    case D3D12OperationCode::ExecuteCompute:
-    case D3D12OperationCode::ExecuteCopy:
-    case D3D12OperationCode::EndQueueBatch:
-    case D3D12OperationCode::SignalQueue:
-    case D3D12OperationCode::WaitQueue:
-    case D3D12OperationCode::WaitTemporal:
-    case D3D12OperationCode::ReleaseExternal:
-    case D3D12OperationCode::PresentSurface:
-        return true;
-    default:
-        return false;
-    }
-}
-
 base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view)
 {
     const auto fail = [](const char* message)
@@ -973,12 +975,21 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
     std::vector<bool> layoutCreated(view.BindingLayouts().size(), false);
     std::vector<bool> rasterCreated(view.Executables().size(), false);
     std::vector<bool> computeCreated(view.ComputeExecutables().size(), false);
+    std::uint32_t descriptorHeapCreationCount = 0;
+    const QueueId canonicalLoadQueue{view.Profile().copyQueueCount != 0
+        ? view.Profile().directQueueCount + view.Profile().computeQueueCount
+        : 0u};
 
     const auto validateStream = [&](std::span<const OperationView> operations, bool load)
         -> base::Result<void, PackageError>
     {
         std::vector<bool> batchOpen(static_cast<std::size_t>(queueCount), false);
         std::map<std::uint32_t, std::pair<QueueId, std::size_t>> signalPoints;
+        std::vector<std::uint8_t> externalPhase(view.ExternalSlots().size(), 0);
+        std::vector<bool> dynamicApplied(view.DynamicSlots().size(), false);
+        std::vector<std::uint8_t> surfacePhase(view.SurfaceSlots().size(), 0);
+        std::map<std::uint64_t, ResourceState> lastTransitionState;
+        bool loadBatchSeen = false;
         std::uint32_t nextSignalPoint = 0;
         for (std::size_t index = 0; index < operations.size(); ++index)
         {
@@ -996,8 +1007,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
         for (std::size_t operationIndex = 0; operationIndex < operations.size(); ++operationIndex)
         {
             const auto& operation = operations[operationIndex];
-            const auto expectedVersion = ExpectedOperationVersion(operation.opcode);
-            if (!KnownOpcode(operation.opcode) || operation.operationVersion != expectedVersion || operation.flags != 0)
+            const auto expectedVersion = OperationVersion(operation.opcode);
+            if (!IsKnownOperation(operation.opcode) || operation.operationVersion != expectedVersion || operation.flags != 0)
                 return fail("operation envelope or operation version is invalid");
 
             const bool metadataOperation =
@@ -1013,11 +1024,15 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                 operation.opcode == D3D12OperationCode::PresentSurface;
             if (metadataOperation ? operation.queue.IsValid() : !validQueue(operation.queue))
                 return fail("operation queue is outside the target profile");
+            if (load && !metadataOperation && operation.queue != canonicalLoadQueue)
+                return fail("load-stream GPU operations must use the canonical Package load queue");
 
             switch (operation.opcode)
             {
             case D3D12OperationCode::CreateDescriptorHeaps:
-                if (!load || !operation.payload.empty()) return fail("CreateDescriptorHeaps is invalid");
+                if (!load || !operation.payload.empty() || operationIndex != 0 ||
+                    ++descriptorHeapCreationCount != 1)
+                    return fail("CreateDescriptorHeaps must be the unique first load operation");
                 break;
             case D3D12OperationCode::CreateResource:
             {
@@ -1033,7 +1048,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             case D3D12OperationCode::UploadBuffer:
             {
                 auto payload = DecodeUploadBuffer(operation.payload);
-                if (!load || !payload || !resourceValid(payload.Value().resource) || payload.Value().bytes == 0 ||
+                if (!load || !payload || !resourceValid(payload.Value().resource) ||
+                    !resourceCreated[payload.Value().resource.value] || payload.Value().bytes == 0 ||
                     !inInitialData(payload.Value().sourceOffset, payload.Value().bytes))
                     return fail("UploadBuffer payload is invalid");
                 break;
@@ -1042,6 +1058,7 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             {
                 auto payload = DecodeUploadTexture(operation.payload);
                 if (!load || !payload || !resourceValid(payload.Value().resource) ||
+                    !resourceCreated[payload.Value().resource.value] ||
                     payload.Value().sourceSliceBytes == 0 ||
                     !inInitialData(payload.Value().sourceOffset, payload.Value().sourceSliceBytes))
                     return fail("UploadTexture payload is invalid");
@@ -1051,6 +1068,7 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             {
                 auto payload = DecodeInitializeState(operation.payload);
                 if (!load || !payload || !resourceValid(payload.Value().resource) ||
+                    !resourceCreated[payload.Value().resource.value] ||
                     (isCopyQueue(operation.queue) &&
                      (!IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))))
                     return fail("InitializeState payload is invalid");
@@ -1059,7 +1077,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             case D3D12OperationCode::VerifyBufferContents:
             {
                 auto payload = DecodeVerifyBufferContents(operation.payload);
-                if (!load || !payload || !resourceValid(payload.Value().resource) || payload.Value().bytes == 0 ||
+                if (!load || !payload || !resourceValid(payload.Value().resource) ||
+                    !resourceCreated[payload.Value().resource.value] || payload.Value().bytes == 0 ||
                     !inInitialData(payload.Value().expectedDataOffset, payload.Value().bytes))
                     return fail("VerifyBufferContents payload is invalid");
                 break;
@@ -1068,7 +1087,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             {
                 auto payload = DecodeVerifyTextureContents(operation.payload);
                 const auto bytes = payload ? static_cast<std::uint64_t>(payload.Value().expectedRowBytes) * payload.Value().height : 0;
-                if (!load || !payload || !resourceValid(payload.Value().resource) || bytes == 0 ||
+                if (!load || !payload || !resourceValid(payload.Value().resource) ||
+                    !resourceCreated[payload.Value().resource.value] || bytes == 0 ||
                     !inInitialData(payload.Value().expectedDataOffset, bytes))
                     return fail("VerifyTextureContents payload is invalid");
                 break;
@@ -1088,7 +1108,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                 auto payload = DecodeCreateGraphicsPipeline(operation.payload);
                 if (!load || !payload || !payload.Value().executable.IsValid() ||
                     payload.Value().executable.value >= view.Executables().size() ||
-                    rasterCreated[payload.Value().executable.value])
+                    rasterCreated[payload.Value().executable.value] ||
+                    !layoutCreated[view.Executables()[payload.Value().executable.value].bindingLayout.value])
                     return fail("CreateGraphicsPipeline payload is invalid or duplicated");
                 rasterCreated[payload.Value().executable.value] = true;
                 break;
@@ -1098,7 +1119,8 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                 auto payload = DecodeCreateComputePipeline(operation.payload);
                 if (!load || !payload || !payload.Value().executable.IsValid() ||
                     payload.Value().executable.value >= view.ComputeExecutables().size() ||
-                    computeCreated[payload.Value().executable.value])
+                    computeCreated[payload.Value().executable.value] ||
+                    !layoutCreated[view.ComputeExecutables()[payload.Value().executable.value].bindingLayout.value])
                     return fail("CreateComputePipeline payload is invalid or duplicated");
                 computeCreated[payload.Value().executable.value] = true;
                 break;
@@ -1107,38 +1129,48 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
             {
                 auto payload = DecodeAcquireSurfaceImage(operation.payload);
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.SurfaceSlots().size())
-                    return fail("AcquireSurfaceImage payload is invalid");
+                    payload.Value().slot.value >= view.SurfaceSlots().size() ||
+                    surfacePhase[payload.Value().slot.value] != 0)
+                    return fail("AcquireSurfaceImage payload is invalid or duplicated");
+                surfacePhase[payload.Value().slot.value] = 1;
                 break;
             }
             case D3D12OperationCode::AcquireExternal:
             {
                 auto payload = DecodeAcquireExternal(operation.payload);
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.ExternalSlots().size())
-                    return fail("AcquireExternal payload is invalid");
+                    payload.Value().slot.value >= view.ExternalSlots().size() ||
+                    externalPhase[payload.Value().slot.value] != 0)
+                    return fail("AcquireExternal payload is invalid or duplicated");
+                externalPhase[payload.Value().slot.value] = 1;
                 break;
             }
             case D3D12OperationCode::WaitExternal:
             {
                 auto payload = DecodeWaitExternal(operation.payload);
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.ExternalSlots().size())
-                    return fail("WaitExternal payload is invalid");
+                    payload.Value().slot.value >= view.ExternalSlots().size() ||
+                    externalPhase[payload.Value().slot.value] != 1)
+                    return fail("WaitExternal must follow the unique AcquireExternal for its slot");
+                externalPhase[payload.Value().slot.value] = 2;
                 break;
             }
             case D3D12OperationCode::ApplyDynamicData:
             {
                 auto payload = DecodeApplyDynamicData(operation.payload);
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.DynamicSlots().size())
-                    return fail("ApplyDynamicData payload is invalid");
+                    payload.Value().slot.value >= view.DynamicSlots().size() ||
+                    dynamicApplied[payload.Value().slot.value])
+                    return fail("ApplyDynamicData payload is invalid or duplicated");
+                dynamicApplied[payload.Value().slot.value] = true;
                 break;
             }
             case D3D12OperationCode::BeginQueueBatch:
-                if (!operation.payload.empty() || batchOpen[operation.queue.value])
-                    return fail("queue batch begin is invalid");
+                if (!operation.payload.empty() || batchOpen[operation.queue.value] ||
+                    (load && loadBatchSeen))
+                    return fail("queue batch begin is invalid or non-canonical");
                 batchOpen[operation.queue.value] = true;
+                if (load) loadBatchSeen = true;
                 break;
             case D3D12OperationCode::EndQueueBatch:
                 if (!operation.payload.empty() || !batchOpen[operation.queue.value])
@@ -1153,30 +1185,55 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                     (isCopyQueue(operation.queue) &&
                      (!IsCopyQueueState(payload.Value().before) || !IsCopyQueueState(payload.Value().after))))
                     return fail("Transition payload is invalid");
+                const auto& transitionView = view.Views()[payload.Value().view.value];
+                const auto relation =
+                    (transitionView.flags & static_cast<std::uint32_t>(ResourceViewFlags::TemporalPrevious)) != 0 ? 2ull :
+                    (transitionView.flags & static_cast<std::uint32_t>(ResourceViewFlags::TemporalCurrent)) != 0 ? 1ull : 0ull;
+                const auto stateKey = static_cast<std::uint64_t>(transitionView.resource.value) * 3ull + relation;
+                const auto prior = lastTransitionState.find(stateKey);
+                if (prior != lastTransitionState.end() && prior->second != payload.Value().before)
+                    return fail("Transition before-state contradicts the preceding state of the same physical view class");
+                lastTransitionState[stateKey] = payload.Value().after;
                 break;
             }
             case D3D12OperationCode::ActivateAlias:
             {
                 auto payload = DecodeActivateAlias(operation.payload);
-                if (!payload || !resourceValid(payload.Value().after) ||
+                if (!load || !payload || !batchOpen[operation.queue.value] ||
+                    !resourceValid(payload.Value().after) ||
                     (payload.Value().before.IsValid() && !resourceValid(payload.Value().before)))
                     return fail("ActivateAlias payload is invalid");
+                const auto& afterResource = view.Resources()[payload.Value().after.value];
+                if (afterResource.origin != ResourceOrigin::PackageOwned ||
+                    !afterResource.allocation.IsValid() ||
+                    afterResource.allocation.value >= view.Allocations().size() ||
+                    view.Allocations()[afterResource.allocation.value].kind != AllocationKind::Placed)
+                    return fail("ActivateAlias target is not backed by a declared placed alias allocation");
+                if (payload.Value().before.IsValid())
+                {
+                    const auto& beforeResource = view.Resources()[payload.Value().before.value];
+                    if (beforeResource.allocation != afterResource.allocation ||
+                        payload.Value().before == payload.Value().after)
+                        return fail("ActivateAlias resources do not share one distinct alias allocation");
+                }
                 break;
             }
             case D3D12OperationCode::ExecuteRaster:
             {
                 auto payload = DecodeExecuteRaster(operation.payload);
                 if (load || !payload || !batchOpen[operation.queue.value] ||
+                    operation.queue.value >= view.Profile().directQueueCount ||
                     !payload.Value().command.IsValid() || payload.Value().command.value >= view.RasterCommands().size())
-                    return fail("ExecuteRaster payload is invalid");
+                    return fail("ExecuteRaster requires a Direct queue and a valid command");
                 break;
             }
             case D3D12OperationCode::ExecuteCompute:
             {
                 auto payload = DecodeExecuteCompute(operation.payload);
                 if (load || !payload || !batchOpen[operation.queue.value] ||
+                    isCopyQueue(operation.queue) ||
                     !payload.Value().command.IsValid() || payload.Value().command.value >= view.ComputeCommands().size())
-                    return fail("ExecuteCompute payload is invalid");
+                    return fail("ExecuteCompute requires a Direct/Compute queue and a valid command");
                 break;
             }
             case D3D12OperationCode::ExecuteCopy:
@@ -1235,16 +1292,20 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
                 const auto signal = payload ? signalPoints.find(payload.Value().releaseSignalPoint.value) : signalPoints.end();
                 if (load || !payload || !payload.Value().slot.IsValid() ||
                     payload.Value().slot.value >= view.ExternalSlots().size() ||
+                    externalPhase[payload.Value().slot.value] != 2 ||
                     signal == signalPoints.end() || signal->second.second >= operationIndex)
-                    return fail("ReleaseExternal must reference a preceding last-use signal point");
+                    return fail("ReleaseExternal must follow Acquire/Wait and reference a preceding last-use signal point");
+                externalPhase[payload.Value().slot.value] = 3;
                 break;
             }
             case D3D12OperationCode::PresentSurface:
             {
                 auto payload = DecodePresentSurface(operation.payload);
                 if (load || !payload || !payload.Value().slot.IsValid() ||
-                    payload.Value().slot.value >= view.SurfaceSlots().size())
-                    return fail("PresentSurface payload is invalid");
+                    payload.Value().slot.value >= view.SurfaceSlots().size() ||
+                    surfacePhase[payload.Value().slot.value] != 1)
+                    return fail("PresentSurface must follow the unique Surface acquisition");
+                surfacePhase[payload.Value().slot.value] = 2;
                 break;
             }
             default:
@@ -1253,11 +1314,25 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
         }
         if (std::any_of(batchOpen.begin(), batchOpen.end(), [](bool open) { return open; }))
             return fail("operation stream ends with an open queue batch");
+        if (!load)
+        {
+            if (std::any_of(externalPhase.begin(), externalPhase.end(),
+                    [](std::uint8_t phase) { return phase != 3; }))
+                return fail("every External slot requires exactly one Acquire/Wait/Release sequence");
+            if (std::any_of(dynamicApplied.begin(), dynamicApplied.end(),
+                    [](bool applied) { return !applied; }))
+                return fail("every Dynamic slot requires exactly one ApplyDynamicData operation");
+            if (std::any_of(surfacePhase.begin(), surfacePhase.end(),
+                    [](std::uint8_t phase) { return phase != 2; }))
+                return fail("every Surface slot requires exactly one Acquire/Present sequence");
+        }
         return base::Result<void, PackageError>::Success();
     };
 
     auto loadResult = validateStream(view.LoadOperations(), true);
     if (!loadResult) return loadResult;
+    if (descriptorHeapCreationCount != 1)
+        return fail("the load stream must contain exactly one CreateDescriptorHeaps operation");
     for (std::size_t index = 0; index < view.Resources().size(); ++index)
         if (view.Resources()[index].origin == ResourceOrigin::PackageOwned && !resourceCreated[index])
             return fail("a Package-owned resource has no CreateResource operation");
@@ -1276,7 +1351,8 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
         return base::Result<void, PackageError>::Failure(Error(code, message, section));
     };
     const auto& manifest = view.Manifest();
-    if (manifest.resourceCount != view.Resources().size() ||
+    if (manifest.flags != 0 ||
+        manifest.resourceCount != view.Resources().size() ||
         manifest.allocationCount != view.Allocations().size() ||
         manifest.viewCount != view.Views().size() || manifest.shaderCount != view.Shaders().size() ||
         manifest.programCount != view.Programs().size() ||
@@ -1290,7 +1366,7 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
         manifest.dynamicSlotCount != view.DynamicSlots().size() ||
         manifest.externalSlotCount != view.ExternalSlots().size() ||
         manifest.surfaceSlotCount != view.SurfaceSlots().size())
-        return fail(PackageErrorCode::InvalidReference, "manifest counts do not match decoded tables");
+        return fail(PackageErrorCode::InvalidReference, "manifest flags or counts do not match decoded tables");
 
     if (!Dense(view.Resources()) || !Dense(view.Allocations()) || !Dense(view.Views()) ||
         !Dense(view.Shaders()) || !Dense(view.Programs()) || !Dense(view.BindingLayouts()) ||
@@ -1311,21 +1387,84 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
         auto bytes = view.ResolveBlob(blob);
         return bytes && base::Sha256(bytes.Value()) == digest;
     };
+    constexpr std::uint32_t KnownResourceFlags =
+        static_cast<std::uint32_t>(ResourceFlags::FrameLocal) |
+        static_cast<std::uint32_t>(ResourceFlags::Temporal) |
+        static_cast<std::uint32_t>(ResourceFlags::Aliased);
+    constexpr std::uint32_t KnownViewFlags =
+        static_cast<std::uint32_t>(ResourceViewFlags::TemporalCurrent) |
+        static_cast<std::uint32_t>(ResourceViewFlags::TemporalPrevious);
+    const auto hasResourceFlag = [](const ResourceArtifact& resource, ResourceFlags flag) {
+        return (resource.flags & static_cast<std::uint32_t>(flag)) != 0;
+    };
+    const auto hasViewFlag = [](const ResourceViewArtifact& resourceView, ResourceViewFlags flag) {
+        return (resourceView.flags & static_cast<std::uint32_t>(flag)) != 0;
+    };
+    const auto descriptorBacked = [](ViewClass viewClass) {
+        return viewClass == ViewClass::ShaderResource || viewClass == ViewClass::UnorderedAccess ||
+               viewClass == ViewClass::RenderTarget || viewClass == ViewClass::DepthStencil;
+    };
 
+    std::vector<std::vector<std::uint32_t>> allocationUsers(view.Allocations().size());
+    std::uint32_t expectedFirstView = 0;
     for (std::size_t index = 0; index < view.Resources().size(); ++index)
     {
         const auto& resource = view.Resources()[index];
-        if (resource.firstView > view.Views().size() ||
+        if (resource.firstView != expectedFirstView ||
+            resource.firstView > view.Views().size() ||
             resource.viewCount > view.Views().size() - resource.firstView ||
             resource.initialDataOffset > view.InitialData().size() ||
             resource.initialDataSize > view.InitialData().size() - resource.initialDataOffset)
-            return fail(PackageErrorCode::InvalidReference, "resource range is out of bounds",
+            return fail(PackageErrorCode::InvalidReference, "resource ranges are non-canonical or out of bounds",
                         SectionKind::D3D12ResourceTable);
+        expectedFirstView += resource.viewCount;
         for (std::uint32_t viewIndex = resource.firstView;
              viewIndex < resource.firstView + resource.viewCount; ++viewIndex)
             if (view.Views()[viewIndex].resource.value != index)
                 return fail(PackageErrorCode::InvalidReference, "resource view range is not contiguous",
                             SectionKind::D3D12ResourceTable);
+
+        if ((resource.flags & ~KnownResourceFlags) != 0 || resource.usageFlags != 0 ||
+            (hasResourceFlag(resource, ResourceFlags::FrameLocal) &&
+             hasResourceFlag(resource, ResourceFlags::Temporal)))
+            return fail(PackageErrorCode::InvalidReference, "resource flags are unsupported or contradictory",
+                        SectionKind::D3D12ResourceTable);
+        if (resource.resourceKind != ResourceKind::Buffer &&
+            resource.resourceKind != ResourceKind::Texture2D &&
+            resource.resourceKind != ResourceKind::SurfaceImage)
+            return fail(PackageErrorCode::InvalidEnumValue, "resource kind is outside the Level 2 vocabulary",
+                        SectionKind::D3D12ResourceTable);
+        if (resource.resourceKind == ResourceKind::Buffer)
+        {
+            if (resource.extentMode != ExtentMode::Fixed || resource.format != Format::Unknown ||
+                resource.sizeBytes == 0 || resource.width != 0 || resource.height != 0 ||
+                resource.depthOrArraySize != 0 || resource.mipLevels != 0 ||
+                resource.sampleCount != 1 || resource.planeCount != 1 ||
+                resource.initialDataSize > resource.sizeBytes)
+                return fail(PackageErrorCode::InvalidReference, "Buffer resource shape is invalid",
+                            SectionKind::D3D12ResourceTable);
+        }
+        else if (resource.resourceKind == ResourceKind::Texture2D)
+        {
+            if (resource.sizeBytes != 0 || resource.depthOrArraySize != 1 || resource.mipLevels != 1 ||
+                resource.sampleCount != 1 || resource.planeCount != 1 ||
+                (resource.extentMode == ExtentMode::Fixed &&
+                 (resource.width == 0 || resource.height == 0 || resource.format != Format::B8G8R8A8Unorm)) ||
+                (resource.extentMode == ExtentMode::SurfaceRelative &&
+                 (resource.width != 0 || resource.height != 0 || resource.format != Format::D32Float)) ||
+                (resource.extentMode != ExtentMode::Fixed && resource.extentMode != ExtentMode::SurfaceRelative))
+                return fail(PackageErrorCode::InvalidReference, "Texture2D resource shape is invalid",
+                            SectionKind::D3D12ResourceTable);
+        }
+        else
+        {
+            if (resource.origin != ResourceOrigin::Surface || resource.extentMode != ExtentMode::SurfaceRelative ||
+                resource.format != Format::B8G8R8A8Unorm || resource.sizeBytes != 0 ||
+                resource.width != 0 || resource.height != 0 || resource.depthOrArraySize != 0 ||
+                resource.mipLevels != 0 || resource.sampleCount != 1 || resource.planeCount != 1)
+                return fail(PackageErrorCode::InvalidReference, "Surface resource shape is invalid",
+                            SectionKind::D3D12ResourceTable);
+        }
 
         if (resource.origin == ResourceOrigin::PackageOwned)
         {
@@ -1338,17 +1477,20 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
             if (allocation.physicalInstanceCount != resource.physicalInstanceCount)
                 return fail(PackageErrorCode::InvalidReference, "resource/allocation instance counts differ",
                             SectionKind::D3D12AllocationTable);
+            allocationUsers[resource.allocation.value].push_back(static_cast<std::uint32_t>(index));
         }
         else if (resource.origin == ResourceOrigin::External)
         {
-            if (resource.allocation.IsValid() || resource.rebuildPolicy != RebuildPolicy::RequireExternalRebind ||
+            if (resource.resourceKind != ResourceKind::Buffer || resource.flags != 0 ||
+                resource.allocation.IsValid() || resource.rebuildPolicy != RebuildPolicy::RequireExternalRebind ||
                 resource.physicalInstanceCount != 1 || resource.initialDataSize != 0)
                 return fail(PackageErrorCode::InvalidReference, "External resource contract is invalid",
                             SectionKind::D3D12ResourceTable);
         }
         else if (resource.origin == ResourceOrigin::Surface)
         {
-            if (resource.allocation.IsValid() || resource.rebuildPolicy != RebuildPolicy::RuntimeManaged ||
+            if (resource.flags != 0 || resource.allocation.IsValid() ||
+                resource.rebuildPolicy != RebuildPolicy::RuntimeManaged ||
                 resource.physicalInstanceCount != 0 || resource.initialDataSize != 0)
                 return fail(PackageErrorCode::InvalidReference, "Surface resource contract is invalid",
                             SectionKind::D3D12ResourceTable);
@@ -1359,71 +1501,201 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
                         SectionKind::D3D12ResourceTable);
         }
     }
+    if (expectedFirstView != view.Views().size())
+        return fail(PackageErrorCode::InvalidReference, "resource view ranges do not partition the View table",
+                    SectionKind::D3D12ResourceTable);
 
-    for (const auto& allocation : view.Allocations())
+    std::set<std::uint32_t> aliasGroups;
+    for (std::size_t index = 0; index < view.Allocations().size(); ++index)
     {
-        if (allocation.kind != AllocationKind::Committed && allocation.kind != AllocationKind::Placed &&
-            allocation.kind != AllocationKind::RuntimeManaged)
-            return fail(PackageErrorCode::InvalidEnumValue, "allocation kind is unknown",
+        const auto& allocation = view.Allocations()[index];
+        if ((allocation.kind != AllocationKind::Committed && allocation.kind != AllocationKind::Placed) ||
+            (allocation.heapClass != HeapClass::DefaultBuffer &&
+             allocation.heapClass != HeapClass::DefaultTexture &&
+             allocation.heapClass != HeapClass::RenderTargetOrDepth &&
+             allocation.heapClass != HeapClass::Upload) ||
+            allocation.flags != 0 || allocation.physicalInstanceCount == 0 ||
+            allocation.alignment == 0 || !std::has_single_bit(allocation.alignment) ||
+            allocationUsers[index].empty())
+            return fail(PackageErrorCode::InvalidReference, "allocation contract is invalid",
                         SectionKind::D3D12AllocationTable);
-        if (allocation.physicalInstanceCount == 0 || allocation.alignment == 0)
-            return fail(PackageErrorCode::InvalidReference, "allocation shape is invalid",
-                        SectionKind::D3D12AllocationTable);
-        if (allocation.kind == AllocationKind::Placed && allocation.aliasGroup == InvalidIndex)
-            return fail(PackageErrorCode::InvalidReference, "placed allocation has no alias group",
-                        SectionKind::D3D12AllocationTable);
+        if (allocation.kind == AllocationKind::Committed)
+        {
+            if (allocation.aliasGroup != InvalidIndex || allocationUsers[index].size() != 1)
+                return fail(PackageErrorCode::InvalidReference, "committed allocation ownership is invalid",
+                            SectionKind::D3D12AllocationTable);
+        }
+        else
+        {
+            if (allocation.aliasGroup == InvalidIndex || allocationUsers[index].size() != 2 ||
+                !aliasGroups.insert(allocation.aliasGroup).second)
+                return fail(PackageErrorCode::InvalidReference, "placed alias allocation contract is invalid",
+                            SectionKind::D3D12AllocationTable);
+            for (const auto resourceIndex : allocationUsers[index])
+                if (!hasResourceFlag(view.Resources()[resourceIndex], ResourceFlags::Aliased))
+                    return fail(PackageErrorCode::InvalidReference, "placed allocation user lacks the Aliased flag",
+                                SectionKind::D3D12AllocationTable);
+        }
+        for (const auto resourceIndex : allocationUsers[index])
+        {
+            const auto& resource = view.Resources()[resourceIndex];
+            if (resource.resourceKind == ResourceKind::Buffer && allocation.sizeBytes < resource.sizeBytes)
+                return fail(PackageErrorCode::InvalidReference, "allocation is smaller than its Buffer resource",
+                            SectionKind::D3D12AllocationTable);
+            if (resource.resourceKind != ResourceKind::Buffer && allocation.sizeBytes != 0)
+                return fail(PackageErrorCode::InvalidReference, "Texture allocation size must remain target-resolved",
+                            SectionKind::D3D12AllocationTable);
+            const auto expectedHeap = resource.resourceKind == ResourceKind::Buffer ?
+                (resource.initialState.stateClass == StateClass::Explicit &&
+                 resource.initialState.explicitBits == static_cast<std::uint32_t>(ExplicitStateBits::ConstantBuffer) ?
+                    HeapClass::Upload : HeapClass::DefaultBuffer) :
+                (resource.format == Format::D32Float ? HeapClass::RenderTargetOrDepth : HeapClass::DefaultTexture);
+            if (allocation.heapClass != expectedHeap)
+                return fail(PackageErrorCode::InvalidReference, "allocation heap class does not match its resource",
+                            SectionKind::D3D12AllocationTable);
+            if ((allocation.heapClass == HeapClass::Upload) !=
+                (resource.initialState.stateClass == StateClass::Explicit &&
+                 resource.initialState.explicitBits == static_cast<std::uint32_t>(ExplicitStateBits::ConstantBuffer)))
+                return fail(PackageErrorCode::InvalidReference, "Upload allocation and dynamic resource state disagree",
+                            SectionKind::D3D12AllocationTable);
+        }
     }
 
+    std::array<std::set<std::uint32_t>, 4> descriptorIndices;
     for (const auto& resourceView : view.Views())
     {
-        if (!resourceView.resource.IsValid() || resourceView.resource.value >= view.Resources().size())
-            return fail(PackageErrorCode::InvalidReference, "view references an unknown resource",
+        if (!resourceView.resource.IsValid() || resourceView.resource.value >= view.Resources().size() ||
+            (resourceView.flags & ~KnownViewFlags) != 0 ||
+            (hasViewFlag(resourceView, ResourceViewFlags::TemporalCurrent) &&
+             hasViewFlag(resourceView, ResourceViewFlags::TemporalPrevious)))
+            return fail(PackageErrorCode::InvalidReference, "view references or flags are invalid",
                         SectionKind::D3D12ViewTable);
-        std::uint32_t capacity = 0;
-        if (resourceView.descriptorHeapClass == 1) capacity = view.Profile().rtvDescriptorCount;
-        else if (resourceView.descriptorHeapClass == 2) capacity = view.Profile().shaderDescriptorCount;
-        else if (resourceView.descriptorHeapClass == 3) capacity = view.Profile().dsvDescriptorCount;
-        else if (resourceView.descriptorHeapClass != 0)
-            return fail(PackageErrorCode::InvalidReference, "view descriptor heap class is unknown",
+        const auto& resource = view.Resources()[resourceView.resource.value];
+        const bool temporal = hasResourceFlag(resource, ResourceFlags::Temporal);
+        if (temporal != (resourceView.flags != 0))
+            return fail(PackageErrorCode::InvalidReference, "Temporal resource/view identity is incomplete",
                         SectionKind::D3D12ViewTable);
 
+        const bool bufferView = resourceView.viewClass == ViewClass::VertexBuffer ||
+            resourceView.viewClass == ViewClass::IndexBuffer ||
+            resourceView.viewClass == ViewClass::ConstantBuffer ||
+            resourceView.viewClass == ViewClass::UnorderedAccess ||
+            resourceView.viewClass == ViewClass::CopySource ||
+            resourceView.viewClass == ViewClass::CopyDestination ||
+            (resourceView.viewClass == ViewClass::ShaderResource && resource.resourceKind == ResourceKind::Buffer);
+        const bool textureView = resourceView.viewClass == ViewClass::RenderTarget ||
+            resourceView.viewClass == ViewClass::DepthStencil ||
+            resourceView.viewClass == ViewClass::PresentSource ||
+            (resourceView.viewClass == ViewClass::ShaderResource && resource.resourceKind == ResourceKind::Texture2D);
+        if ((bufferView && resource.resourceKind != ResourceKind::Buffer) ||
+            (textureView && resource.resourceKind == ResourceKind::Buffer) || (!bufferView && !textureView))
+            return fail(PackageErrorCode::InvalidReference, "view class does not match its resource",
+                        SectionKind::D3D12ViewTable);
+        if (resourceView.viewClass == ViewClass::RenderTarget && resource.resourceKind != ResourceKind::SurfaceImage)
+            return fail(PackageErrorCode::InvalidReference, "RenderTarget view must reference the presentation Surface",
+                        SectionKind::D3D12ViewTable);
+        if (resourceView.viewClass == ViewClass::DepthStencil &&
+            (resource.resourceKind != ResourceKind::Texture2D || resource.format != Format::D32Float))
+            return fail(PackageErrorCode::InvalidReference, "DepthStencil view must reference Depth32 Texture2D",
+                        SectionKind::D3D12ViewTable);
+        if (resourceView.viewClass == ViewClass::PresentSource && resource.resourceKind != ResourceKind::SurfaceImage)
+            return fail(PackageErrorCode::InvalidReference, "PresentSource view must reference the Surface",
+                        SectionKind::D3D12ViewTable);
+
+        if (resource.resourceKind == ResourceKind::Buffer)
+        {
+            if (resourceView.byteSize == 0 || resourceView.byteOffset > resource.sizeBytes ||
+                resourceView.byteSize > resource.sizeBytes - resourceView.byteOffset ||
+                resourceView.firstMip != 0 || resourceView.mipCount != 0 ||
+                resourceView.firstArrayLayer != 0 || resourceView.arrayLayerCount != 0 ||
+                resourceView.firstPlane != 0 || resourceView.planeCount != 0)
+                return fail(PackageErrorCode::InvalidReference, "Buffer view range is invalid",
+                            SectionKind::D3D12ViewTable);
+        }
+        else if (resourceView.byteOffset != 0 || resourceView.byteSize != 0 || resourceView.strideBytes != 0 ||
+                 resourceView.firstMip != 0 || resourceView.mipCount != 1 ||
+                 resourceView.firstArrayLayer != 0 || resourceView.arrayLayerCount != 1 ||
+                 resourceView.firstPlane != 0 || resourceView.planeCount != 1 ||
+                 resourceView.format != resource.format)
+        {
+            return fail(PackageErrorCode::InvalidReference, "Texture/Surface view range is invalid",
+                        SectionKind::D3D12ViewTable);
+        }
+
+        const std::uint32_t expectedHeap =
+            resourceView.viewClass == ViewClass::RenderTarget ? 1u :
+            (resourceView.viewClass == ViewClass::ShaderResource ||
+             resourceView.viewClass == ViewClass::UnorderedAccess) ? 2u :
+            resourceView.viewClass == ViewClass::DepthStencil ? 3u : 0u;
+        if (resourceView.descriptorHeapClass != expectedHeap ||
+            descriptorBacked(resourceView.viewClass) != (resourceView.descriptorIndex != InvalidIndex))
+            return fail(PackageErrorCode::InvalidReference, "view descriptor class/index is non-canonical",
+                        SectionKind::D3D12ViewTable);
         if (resourceView.descriptorIndex != InvalidIndex)
         {
-            const auto& resource = view.Resources()[resourceView.resource.value];
+            std::uint32_t capacity = expectedHeap == 1 ? view.Profile().rtvDescriptorCount :
+                expectedHeap == 2 ? view.Profile().shaderDescriptorCount : view.Profile().dsvDescriptorCount;
             const auto instances = resource.origin == ResourceOrigin::Surface ?
                 view.Profile().surfaceImageCount : resource.physicalInstanceCount;
+            const auto expectedStride = instances > 1 ? 1u : 0u;
             const auto last = static_cast<std::uint64_t>(resourceView.descriptorIndex) +
                 static_cast<std::uint64_t>(resourceView.descriptorInstanceStride) *
                 (instances == 0 ? 0 : instances - 1);
-            if (capacity == 0 || last >= capacity)
-                return fail(PackageErrorCode::InvalidReference, "view descriptor range exceeds its heap",
+            if (capacity == 0 || resourceView.descriptorInstanceStride != expectedStride || last >= capacity)
+                return fail(PackageErrorCode::InvalidReference, "view descriptor range exceeds or contradicts its heap",
                             SectionKind::D3D12ViewTable);
+            for (std::uint32_t instance = 0; instance < std::max(1u, instances); ++instance)
+            {
+                const auto descriptor = resourceView.descriptorIndex + resourceView.descriptorInstanceStride * instance;
+                if (!descriptorIndices[expectedHeap].insert(descriptor).second)
+                    return fail(PackageErrorCode::InvalidReference, "descriptor plan overlaps another View",
+                                SectionKind::D3D12ViewTable);
+            }
         }
-        else if (resourceView.descriptorHeapClass != 0)
+        else if (resourceView.descriptorHeapClass != 0 || resourceView.descriptorInstanceStride != 0)
         {
-            return fail(PackageErrorCode::InvalidReference, "descriptor-backed view has no descriptor index",
+            return fail(PackageErrorCode::InvalidReference, "non-descriptor view contains descriptor metadata",
                         SectionKind::D3D12ViewTable);
         }
     }
 
     for (const auto& shader : view.Shaders())
-        if (!blobValid(shader.bytecode, shader.bytecodeDigest))
-            return fail(PackageErrorCode::DigestMismatch, "shader bytecode digest mismatch",
+    {
+        if ((shader.stage != ShaderStage::Vertex && shader.stage != ShaderStage::Pixel &&
+             shader.stage != ShaderStage::Compute) || shader.format != ShaderBinaryFormat::Dxbc ||
+            shader.shaderModelMajor != view.Profile().shaderModelMajor ||
+            shader.shaderModelMinor != view.Profile().shaderModelMinor || shader.flags != 0 ||
+            !blobValid(shader.bytecode, shader.bytecodeDigest))
+            return fail(PackageErrorCode::DigestMismatch, "shader contract or bytecode digest is invalid",
                         SectionKind::D3D12ShaderTable);
+    }
 
+    std::uint32_t expectedParameterFirst = 0;
+    std::uint32_t expectedDescriptorFirst = 0;
+    std::uint32_t expectedSamplerFirst = 0;
     for (const auto& layout : view.BindingLayouts())
     {
-        if (!rangeValid(layout.parameterRange, view.RootParameters().size()) ||
+        if (layout.rootSignatureMajor != view.Profile().rootSignatureMajor ||
+            layout.rootSignatureMinor != view.Profile().rootSignatureMinor || layout.flags != 0 ||
+            layout.parameterRange.first != expectedParameterFirst ||
+            layout.descriptorRange.first != expectedDescriptorFirst ||
+            layout.staticSamplerRange.first != expectedSamplerFirst ||
+            !rangeValid(layout.parameterRange, view.RootParameters().size()) ||
+            layout.staticSamplerRange.count > 1 ||
             !blobValid(layout.serializedRootSignature, layout.layoutDigest))
-            return fail(PackageErrorCode::InvalidReference, "binding layout range or digest is invalid",
+            return fail(PackageErrorCode::InvalidReference, "binding layout ranges, flags, or digest are invalid",
                         SectionKind::D3D12BindingLayoutTable);
         std::uint32_t descriptorCount = 0;
         for (std::uint32_t index = layout.parameterRange.first;
              index < layout.parameterRange.first + layout.parameterRange.count; ++index)
         {
             const auto& parameter = view.RootParameters()[index];
-            if (parameter.rootParameterIndex != index - layout.parameterRange.first)
-                return fail(PackageErrorCode::InvalidReference, "root parameter indices are not canonical",
+            if (parameter.rootParameterIndex != index - layout.parameterRange.first ||
+                parameter.registerSpace != 0 || parameter.flags != 0 ||
+                (parameter.visibility != ShaderVisibility::All &&
+                 parameter.visibility != ShaderVisibility::Vertex &&
+                 parameter.visibility != ShaderVisibility::Pixel))
+                return fail(PackageErrorCode::InvalidReference, "root parameter envelope is invalid",
                             SectionKind::D3D12RootParameterTable);
             if (parameter.kind == RootParameterKind::ConstantBuffer)
             {
@@ -1439,6 +1711,11 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
                     parameter.dynamicSlot.IsValid())
                     return fail(PackageErrorCode::InvalidReference, "descriptor root parameter is invalid",
                                 SectionKind::D3D12RootParameterTable);
+                const auto expectedViewClass = parameter.kind == RootParameterKind::ShaderResourceTable ?
+                    ViewClass::ShaderResource : ViewClass::UnorderedAccess;
+                if (view.Views()[parameter.staticView.value].viewClass != expectedViewClass)
+                    return fail(PackageErrorCode::InvalidReference, "root parameter/View classes disagree",
+                                SectionKind::D3D12RootParameterTable);
                 ++descriptorCount;
             }
             else
@@ -1450,25 +1727,35 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
         if (layout.descriptorRange.count != descriptorCount)
             return fail(PackageErrorCode::InvalidReference, "binding descriptor count is inconsistent",
                         SectionKind::D3D12BindingLayoutTable);
+        expectedParameterFirst += layout.parameterRange.count;
+        expectedDescriptorFirst += layout.descriptorRange.count;
+        expectedSamplerFirst += layout.staticSamplerRange.count;
     }
+    if (expectedParameterFirst != view.RootParameters().size())
+        return fail(PackageErrorCode::InvalidReference, "binding layouts do not partition root parameters",
+                    SectionKind::D3D12BindingLayoutTable);
 
     for (const auto& program : view.Programs())
     {
-        if (!program.bindingLayout.IsValid() || program.bindingLayout.value >= view.BindingLayouts().size())
-            return fail(PackageErrorCode::InvalidReference, "program references an unknown binding layout",
+        if (!program.bindingLayout.IsValid() || program.bindingLayout.value >= view.BindingLayouts().size() ||
+            program.flags != 0)
+            return fail(PackageErrorCode::InvalidReference, "program references or flags are invalid",
                         SectionKind::D3D12ProgramTable);
         if (program.kind == ProgramKind::Raster)
         {
             if (!program.vertexShader.IsValid() || program.vertexShader.value >= view.Shaders().size() ||
                 !program.pixelShader.IsValid() || program.pixelShader.value >= view.Shaders().size() ||
-                program.computeShader.IsValid())
+                program.computeShader.IsValid() ||
+                view.Shaders()[program.vertexShader.value].stage != ShaderStage::Vertex ||
+                view.Shaders()[program.pixelShader.value].stage != ShaderStage::Pixel)
                 return fail(PackageErrorCode::InvalidReference, "raster program shader references are invalid",
                             SectionKind::D3D12ProgramTable);
         }
         else if (program.kind == ProgramKind::Compute)
         {
             if (!program.computeShader.IsValid() || program.computeShader.value >= view.Shaders().size() ||
-                program.vertexShader.IsValid() || program.pixelShader.IsValid())
+                program.vertexShader.IsValid() || program.pixelShader.IsValid() ||
+                view.Shaders()[program.computeShader.value].stage != ShaderStage::Compute)
                 return fail(PackageErrorCode::InvalidReference, "compute program shader references are invalid",
                             SectionKind::D3D12ProgramTable);
         }
@@ -1477,48 +1764,123 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
     }
 
     for (const auto& executable : view.Executables())
+    {
         if (!executable.program.IsValid() || executable.program.value >= view.Programs().size() ||
-            !executable.bindingLayout.IsValid() || executable.bindingLayout.value >= view.BindingLayouts().size() ||
-            !rangeValid(executable.vertexElementRange, view.VertexElements().size()))
-            return fail(PackageErrorCode::InvalidReference, "raster executable references are invalid",
+            view.Programs()[executable.program.value].kind != ProgramKind::Raster ||
+            !executable.bindingLayout.IsValid() ||
+            executable.bindingLayout != view.Programs()[executable.program.value].bindingLayout ||
+            !rangeValid(executable.vertexElementRange, view.VertexElements().size()) ||
+            executable.vertexElementRange.count == 0 || executable.colorFormatRange.first != 0 ||
+            executable.colorFormatRange.count != 1 || executable.colorFormat != Format::B8G8R8A8Unorm ||
+            (executable.depthFormat != Format::Unknown && executable.depthFormat != Format::D32Float) ||
+            executable.primitiveTopology != PrimitiveTopology::TriangleList ||
+            executable.primitiveTopologyType != PrimitiveTopologyType::Triangle ||
+            executable.sampleCount != 1 || executable.sampleQuality != 0)
+            return fail(PackageErrorCode::InvalidReference, "raster executable contract is invalid",
                         SectionKind::D3D12ExecutableTable);
+    }
     for (const auto& executable : view.ComputeExecutables())
         if (!executable.program.IsValid() || executable.program.value >= view.Programs().size() ||
-            !executable.bindingLayout.IsValid() || executable.bindingLayout.value >= view.BindingLayouts().size())
-            return fail(PackageErrorCode::InvalidReference, "compute executable references are invalid",
+            view.Programs()[executable.program.value].kind != ProgramKind::Compute ||
+            !executable.bindingLayout.IsValid() ||
+            executable.bindingLayout != view.Programs()[executable.program.value].bindingLayout ||
+            executable.flags != 0)
+            return fail(PackageErrorCode::InvalidReference, "compute executable contract is invalid",
                         SectionKind::D3D12ComputeExecutableTable);
     for (const auto& command : view.ComputeCommands())
         if (!command.executable.IsValid() || command.executable.value >= view.ComputeExecutables().size() ||
-            command.threadGroupCountX == 0 || command.threadGroupCountY == 0 || command.threadGroupCountZ == 0)
+            command.threadGroupCountX == 0 || command.threadGroupCountY == 0 ||
+            command.threadGroupCountZ == 0 || command.flags != 0)
             return fail(PackageErrorCode::InvalidReference, "compute command is invalid",
                         SectionKind::D3D12ComputeCommandTable);
     for (const auto& command : view.RasterCommands())
     {
         if (!command.executable.IsValid() || command.executable.value >= view.Executables().size() ||
-            !rangeValid(command.vertexViewRange, view.Views().size()) ||
-            !rangeValid(command.colorAttachmentRange, view.Views().size()) || command.vertexCount == 0 ||
-            (command.depthAttachment.IsValid() && command.depthAttachment.value >= view.Views().size()) ||
+            !rangeValid(command.vertexViewRange, view.Views().size()) || command.vertexViewRange.count != 1 ||
+            !rangeValid(command.colorAttachmentRange, view.Views().size()) || command.colorAttachmentRange.count != 1 ||
+            view.Views()[command.vertexViewRange.first].viewClass != ViewClass::VertexBuffer ||
+            view.Views()[command.colorAttachmentRange.first].viewClass != ViewClass::RenderTarget ||
+            command.indexView.IsValid() || command.indexCount != 0 || command.vertexCount == 0 ||
+            command.instanceCount != 1 || command.firstVertex != 0 || command.firstInstance != 0 ||
+            command.firstIndex != 0 || command.baseVertex != 0 ||
+            (command.depthAttachment.IsValid() &&
+             (command.depthAttachment.value >= view.Views().size() ||
+              view.Views()[command.depthAttachment.value].viewClass != ViewClass::DepthStencil)) ||
             !command.attachmentOperation.IsValid() ||
             command.attachmentOperation.value >= view.AttachmentOperations().size())
             return fail(PackageErrorCode::InvalidReference, "raster command is invalid",
                         SectionKind::D3D12RasterCommandTable);
     }
 
+    std::vector<bool> dynamicResources(view.Resources().size(), false);
     for (const auto& slot : view.DynamicSlots())
+    {
         if (!slot.destinationResource.IsValid() || slot.destinationResource.value >= view.Resources().size() ||
             slot.requiredBytes == 0 || slot.requiredAlignment == 0 ||
-            !std::has_single_bit(slot.requiredAlignment))
+            !std::has_single_bit(slot.requiredAlignment) || slot.flags != 0 ||
+            dynamicResources[slot.destinationResource.value])
             return fail(PackageErrorCode::InvalidInvocationSchema, "dynamic slot contract is invalid",
                         SectionKind::D3D12DynamicSlotTable);
+        const auto& resource = view.Resources()[slot.destinationResource.value];
+        if (resource.origin != ResourceOrigin::PackageOwned || resource.resourceKind != ResourceKind::Buffer ||
+            resource.allocation.value >= view.Allocations().size() ||
+            view.Allocations()[resource.allocation.value].heapClass != HeapClass::Upload ||
+            slot.destinationOffset > resource.sizeBytes ||
+            slot.requiredBytes > resource.sizeBytes - slot.destinationOffset ||
+            slot.destinationOffset % slot.requiredAlignment != 0)
+            return fail(PackageErrorCode::InvalidInvocationSchema, "dynamic slot/resource shape is invalid",
+                        SectionKind::D3D12DynamicSlotTable);
+        dynamicResources[slot.destinationResource.value] = true;
+    }
+    for (std::size_t index = 0; index < view.Resources().size(); ++index)
+        if ((view.Resources()[index].allocation.IsValid() &&
+             view.Allocations()[view.Resources()[index].allocation.value].heapClass == HeapClass::Upload) !=
+            dynamicResources[index])
+            return fail(PackageErrorCode::InvalidInvocationSchema, "Upload resources and Dynamic slots are not one-to-one",
+                        SectionKind::D3D12DynamicSlotTable);
+
+    std::vector<bool> externalResources(view.Resources().size(), false);
     for (const auto& slot : view.ExternalSlots())
+    {
         if (!slot.resource.IsValid() || slot.resource.value >= view.Resources().size() ||
-            view.Resources()[slot.resource.value].origin != ResourceOrigin::External || slot.minimumBytes == 0)
+            externalResources[slot.resource.value] ||
+            slot.requiredKind != ResourceKind::Buffer || slot.requiredFormat != Format::Unknown ||
+            slot.minimumBytes == 0 ||
+            slot.synchronizationContract != ExternalSynchronizationContract::CompletionTokenRequired ||
+            slot.flags != static_cast<std::uint32_t>(ExternalSlotFlags::Required))
             return fail(PackageErrorCode::InvalidInvocationSchema, "external slot contract is invalid",
                         SectionKind::D3D12ExternalSlotTable);
+        const auto& resource = view.Resources()[slot.resource.value];
+        if (resource.origin != ResourceOrigin::External || resource.resourceKind != slot.requiredKind ||
+            resource.format != slot.requiredFormat || resource.sizeBytes != slot.minimumBytes)
+            return fail(PackageErrorCode::InvalidInvocationSchema, "external slot/resource shape is invalid",
+                        SectionKind::D3D12ExternalSlotTable);
+        externalResources[slot.resource.value] = true;
+    }
+    for (std::size_t index = 0; index < view.Resources().size(); ++index)
+        if ((view.Resources()[index].origin == ResourceOrigin::External) != externalResources[index])
+            return fail(PackageErrorCode::InvalidInvocationSchema, "External resources and slots are not one-to-one",
+                        SectionKind::D3D12ExternalSlotTable);
+
+    std::vector<bool> surfaceResources(view.Resources().size(), false);
     for (const auto& slot : view.SurfaceSlots())
+    {
         if (!slot.imageResource.IsValid() || slot.imageResource.value >= view.Resources().size() ||
-            view.Resources()[slot.imageResource.value].origin != ResourceOrigin::Surface)
+            surfaceResources[slot.imageResource.value] || slot.flags != 0 ||
+            slot.requiredFormat != Format::B8G8R8A8Unorm ||
+            slot.acquiredState.stateClass != StateClass::Present ||
+            slot.presentedState.stateClass != StateClass::Present)
             return fail(PackageErrorCode::InvalidInvocationSchema, "surface slot contract is invalid",
+                        SectionKind::D3D12SurfaceSlotTable);
+        const auto& resource = view.Resources()[slot.imageResource.value];
+        if (resource.origin != ResourceOrigin::Surface || resource.format != slot.requiredFormat)
+            return fail(PackageErrorCode::InvalidInvocationSchema, "surface slot/resource shape is invalid",
+                        SectionKind::D3D12SurfaceSlotTable);
+        surfaceResources[slot.imageResource.value] = true;
+    }
+    for (std::size_t index = 0; index < view.Resources().size(); ++index)
+        if ((view.Resources()[index].origin == ResourceOrigin::Surface) != surfaceResources[index])
+            return fail(PackageErrorCode::InvalidInvocationSchema, "Surface resources and slots are not one-to-one",
                         SectionKind::D3D12SurfaceSlotTable);
 
     const bool hasSurfaceSlot = !view.SurfaceSlots().empty();
@@ -1526,22 +1888,31 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
         return fail(PackageErrorCode::InvalidTargetProfile,
                     "surfaceImageCount must be zero exactly when the Package has no Surface slot",
                     SectionKind::D3D12TargetProfile);
-    const auto surfaceResourceCount = static_cast<std::size_t>(std::count_if(
-        view.Resources().begin(), view.Resources().end(), [](const ResourceArtifact& resource) {
-            return resource.origin == ResourceOrigin::Surface;
-        }));
-    if (surfaceResourceCount != view.SurfaceSlots().size())
-        return fail(PackageErrorCode::InvalidInvocationSchema,
-                    "Surface resources and Surface slots must have one-to-one correspondence",
-                    SectionKind::D3D12SurfaceSlotTable);
     if (!hasSurfaceSlot && std::any_of(view.Resources().begin(), view.Resources().end(),
         [](const ResourceArtifact& resource) { return resource.extentMode == ExtentMode::SurfaceRelative; }))
         return fail(PackageErrorCode::InvalidReference,
                     "a surface-relative Package resource requires a Surface slot",
                     SectionKind::D3D12ResourceTable);
 
-    return ValidateOperations(view);
+    return base::Result<void, PackageError>::Success();
 }
+}
+
+std::span<const OperationContract> OperationContracts() noexcept
+{
+    return OperationContractTable;
+}
+
+std::uint16_t OperationVersion(D3D12OperationCode code) noexcept
+{
+    const auto found = std::find_if(OperationContractTable.begin(), OperationContractTable.end(),
+        [code](const OperationContract& contract) { return contract.code == code; });
+    return found == OperationContractTable.end() ? 0u : found->version;
+}
+
+bool IsKnownOperation(D3D12OperationCode code) noexcept
+{
+    return OperationVersion(code) != 0;
 }
 
 base::Result<std::vector<std::byte>, PackageError> BuildFrozenPackage(const D3D12PackageDescription& description)
@@ -1668,7 +2039,7 @@ base::Result<std::vector<std::byte>, PackageError> BuildFrozenPackage(const D3D1
     base::BinaryWriter operationWriter;
     for (const auto& operation : description.operations)
     {
-        if (!KnownOpcode(operation.opcode))
+        if (!IsKnownOperation(operation.opcode))
             return base::Result<std::vector<std::byte>, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "unknown operation cannot be serialized"));
         payloadWriter.Align(8);
         const auto offset = payloadWriter.Size();
@@ -1729,7 +2100,7 @@ base::Result<std::vector<std::byte>, PackageError> BuildFrozenPackage(const D3D1
 base::Result<D3D12PackageView, PackageError> D3D12PackageView::Decode(const FrozenExecutablePackage& package)
 {
     if (package.Target() != TargetKindD3D12 || package.Header().targetSchemaVersion != TargetSchemaVersion)
-        return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::UnsupportedTargetSchema, "package is not D3D12 schema V12"));
+        return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::UnsupportedTargetSchema, "package is not D3D12 schema V17"));
     if (package.Header().minimumRuntimeVersion > MinimumRuntimeVersion)
         return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::TargetCapabilityMismatch, "package requires a newer Package Runtime"));
 
@@ -1866,33 +2237,49 @@ base::Result<D3D12PackageView, PackageError> D3D12PackageView::Decode(const Froz
 
     std::vector<OperationView> operations;
     operations.reserve(rawOperations.Value().size());
+    std::uint64_t canonicalPayloadEnd = 0;
     for (std::size_t i = 0; i < rawOperations.Value().size(); ++i)
     {
         const auto& raw = rawOperations.Value()[i];
-        if (!KnownOpcode(raw.opcode) || raw.version != ExpectedOperationVersion(raw.opcode))
+        if (!IsKnownOperation(raw.opcode) || raw.version != OperationVersion(raw.opcode))
         {
             auto error = Error(PackageErrorCode::InvalidOperationStream, "unknown operation or version", SectionKind::OperationTable);
             error.operationIndex = static_cast<std::uint32_t>(i);
             return base::Result<D3D12PackageView, PackageError>::Failure(error);
         }
+        const auto expectedOffset = base::AlignUp(canonicalPayloadEnd, 8);
         std::uint64_t end = 0;
-        if (!base::CheckedAdd(raw.payloadOffset, raw.payloadBytes, end) || end > payloadSection.Value()->bytes.size())
+        if (raw.payloadOffset != expectedOffset ||
+            !base::CheckedAdd(raw.payloadOffset, raw.payloadBytes, end) ||
+            end > payloadSection.Value()->bytes.size())
         {
-            auto error = Error(PackageErrorCode::InvalidOperationStream, "operation payload is out of range", SectionKind::OperationPayload);
+            auto error = Error(PackageErrorCode::InvalidOperationStream,
+                "operation payload packing is non-canonical or out of range",
+                SectionKind::OperationPayload);
             error.operationIndex = static_cast<std::uint32_t>(i);
             return base::Result<D3D12PackageView, PackageError>::Failure(error);
         }
+        canonicalPayloadEnd = end;
         operations.push_back({raw.opcode, raw.version, raw.flags, raw.queue,
             payloadSection.Value()->bytes.subspan(static_cast<std::size_t>(raw.payloadOffset), raw.payloadBytes)});
     }
+    if (canonicalPayloadEnd != payloadSection.Value()->bytes.size())
+        return base::Result<D3D12PackageView, PackageError>::Failure(Error(
+            PackageErrorCode::InvalidOperationStream,
+            "operation payload section contains unreferenced trailing bytes",
+            SectionKind::OperationPayload));
 
     const auto& decodedStreams = streams.Value();
     for (const auto& stream : decodedStreams)
-        if (static_cast<std::uint64_t>(stream.firstOperation) + stream.operationCount > operations.size())
-            return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "operation stream range is invalid", SectionKind::OperationStreamTable));
+        if (stream.flags != 0 ||
+            static_cast<std::uint64_t>(stream.firstOperation) + stream.operationCount > operations.size())
+            return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "operation stream range or flags are invalid", SectionKind::OperationStreamTable));
     if (decodedStreams[0].kind != OperationStreamKind::Load || decodedStreams[1].kind != OperationStreamKind::Frame ||
+        decodedStreams[0].firstOperation != 0 ||
+        decodedStreams[1].firstOperation != decodedStreams[0].operationCount ||
+        static_cast<std::uint64_t>(decodedStreams[1].firstOperation) + decodedStreams[1].operationCount != operations.size() ||
         output.manifest_.loadOperationStream != 0 || output.manifest_.frameOperationStream != 1)
-        return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "load/frame stream ordering is invalid", SectionKind::OperationStreamTable));
+        return base::Result<D3D12PackageView, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "load/frame streams must partition the operation table canonically", SectionKind::OperationStreamTable));
 
     output.loadOperations_.assign(
         operations.begin() + decodedStreams[0].firstOperation,

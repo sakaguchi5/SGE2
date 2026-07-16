@@ -14,7 +14,7 @@ echo Generating Slice-15 Classical/SDF/PGA common experiment package...
 "%BIN%\41_PackageCompiler.exe" "%PACKAGE%" all
 if errorlevel 1 exit /b 1
 
-for %%T in (30_SemanticTests 31_CompilerTests 32_PackageContractTests 33_D3D12ConformanceTests 34_ExperimentTests 36_Level1ScenarioTests 38_Level2MetamorphicTests 39_Level2GeneratedGraphTests) do (
+for %%T in (30_SemanticTests 31_CompilerTests 32_PackageContractTests 33_D3D12ConformanceTests 34_ExperimentTests 36_Level1ScenarioTests 38_Level2MetamorphicTests 39_Level2GeneratedGraphTests 43_Level2AdversarialBoundaryTests) do (
   echo Running %%T...
   "%BIN%\%%T.exe"
   if errorlevel 1 goto :failed
@@ -32,7 +32,7 @@ echo Running 35_D3D12ReadbackTests with WARP...
 "%BIN%\35_D3D12ReadbackTests.exe" "%PACKAGE%"
 if errorlevel 1 exit /b 1
 
-echo All Slice-15 and Level-1 Stage-A/Stage-B/Stage-G/Stage-H/Stage-I/Stage-J/Stage-K tests passed.
+echo All Slice-15 and Level-1 Stage-A/Stage-B/Stage-G/Stage-H/Stage-I/Stage-J/Stage-K/Stage-L tests passed.
 exit /b 0
 
 :failed

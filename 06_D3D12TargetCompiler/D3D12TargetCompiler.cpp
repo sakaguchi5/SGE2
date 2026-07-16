@@ -1425,12 +1425,7 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     const auto addOperation = [&](pkg::D3D12OperationCode code, pkg::QueueId queue,
                                   std::vector<std::byte> payload = {})
     {
-        const std::uint16_t operationVersion =
-            code == pkg::D3D12OperationCode::SignalQueue ||
-            code == pkg::D3D12OperationCode::WaitQueue ||
-            code == pkg::D3D12OperationCode::WaitTemporal ||
-            code == pkg::D3D12OperationCode::ReleaseExternal ||
-            code == pkg::D3D12OperationCode::ExecuteCopy ? 2u : 1u;
+        const auto operationVersion = pkg::OperationVersion(code);
         description.operations.push_back({code, operationVersion, 0, queue, std::move(payload)});
     };
 
