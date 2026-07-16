@@ -659,10 +659,14 @@ base::Result<void, CompileError> ValidateLevel2Capability(
 
     std::uint32_t surfaceCount = 0;
     bool hasTemporal = false;
+    bool hasSurfaceRelativeResource = false;
     for (const auto& resource : graph.resources)
     {
         if (resource.kind == semantic::ResourceKind::SurfaceImage) ++surfaceCount;
         if (resource.lifetime == semantic::LifetimeIntent::Temporal) hasTemporal = true;
+        if (resource.kind == semantic::ResourceKind::Texture2D &&
+            resource.texture2D.extentMeaning == semantic::TextureExtentMeaning::PresentationSurface)
+            hasSurfaceRelativeResource = true;
         if (resource.kind == semantic::ResourceKind::Texture2D && resource.texture2D.mipLevels != 1)
             return Failure<void>("target-feasibility", "Level 2 D3D12 v1 supports Texture2D with exactly one mip level");
         if (resource.kind == semantic::ResourceKind::Texture2D &&
@@ -678,6 +682,8 @@ base::Result<void, CompileError> ValidateLevel2Capability(
         return Failure<void>("target-feasibility", "Level 2 D3D12 v1 supports at most one presentation SurfaceImage");
     if (surfaceCount != 0 && targetProfile.surfaceImageCount == 0)
         return Failure<void>("target-feasibility", "a graph with a SurfaceImage requires a non-zero surface image count");
+    if (hasSurfaceRelativeResource && surfaceCount == 0)
+        return Failure<void>("target-feasibility", "a surface-relative Texture2D requires a presentation SurfaceImage");
     if (hasTemporal && targetProfile.framesInFlight < 2)
         return Failure<void>("target-feasibility", "Temporal resources require at least two frames in flight");
 
@@ -820,7 +826,9 @@ base::Result<LoweredPackageStage, CompileError> LowerPackageStage(
     description.profile.directQueueCount = targetProfile.directQueueCount;
     description.profile.computeQueueCount = targetProfile.computeQueueCount;
     description.profile.copyQueueCount = targetProfile.copyQueueCount;
-    description.profile.surfaceImageCount = targetProfile.surfaceImageCount;
+    const bool packageHasSurface = std::any_of(graph.resources.begin(), graph.resources.end(),
+        [](const semantic::Resource& resource) { return resource.kind == semantic::ResourceKind::SurfaceImage; });
+    description.profile.surfaceImageCount = packageHasSurface ? targetProfile.surfaceImageCount : 0;
     description.profile.rtvDescriptorCount = targetProfile.rtvDescriptorCount;
     description.profile.dsvDescriptorCount = targetProfile.dsvDescriptorCount;
     description.profile.shaderDescriptorCount = targetProfile.shaderDescriptorCount;

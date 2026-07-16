@@ -300,8 +300,8 @@ int main()
 
     auto frozen = sge::package::PackageReader::Read(first.Value().packageBytes);
     if (!frozen) { std::cerr << frozen.Error().message << '\n'; return 6; }
-    if (frozen.Value().Header().targetSchemaVersion != 15 ||
-        frozen.Value().Header().minimumRuntimeVersion != 15)
+    if (frozen.Value().Header().targetSchemaVersion != 16 ||
+        frozen.Value().Header().minimumRuntimeVersion != 16)
         return 7;
     auto decoded = pkg::D3D12PackageView::Decode(frozen.Value());
     if (!decoded) { std::cerr << decoded.Error().message << '\n'; return 8; }

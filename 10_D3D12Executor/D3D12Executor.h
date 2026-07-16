@@ -27,7 +27,7 @@ public:
 
     [[nodiscard]] base::Result<std::unique_ptr<runtime::IPackageInstance>, runtime::RuntimeError> Load(
         std::shared_ptr<const package::FrozenExecutablePackage> package,
-        runtime::ISurfaceHost& surface) override;
+        runtime::ISurfaceHost* surface) override;
 
     [[nodiscard]] base::Result<runtime::FrameSubmission, runtime::RuntimeError> Submit(
         runtime::IPackageInstance& instance,

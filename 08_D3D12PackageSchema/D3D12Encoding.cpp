@@ -18,8 +18,8 @@ namespace sge::package::d3d12_v13
 {
 namespace
 {
-constexpr std::uint32_t TargetSchemaVersion = 15;
-constexpr std::uint32_t MinimumRuntimeVersion = 15;
+constexpr std::uint32_t TargetSchemaVersion = 16;
+constexpr std::uint32_t MinimumRuntimeVersion = 16;
 constexpr std::uint32_t ManifestStride = 72;
 constexpr std::uint32_t ProfileStride = 80;
 constexpr std::uint32_t ResourceStride = 96;
@@ -353,12 +353,11 @@ base::Result<TargetProfile, PackageError> DecodeProfileRecord(base::BinaryReader
     const auto queueCount = static_cast<std::uint64_t>(profile.directQueueCount) +
                             profile.computeQueueCount + profile.copyQueueCount;
     if (profile.framesInFlight == 0 || profile.directQueueCount == 0 || queueCount > 64 ||
-        profile.surfaceImageCount == 0 ||
         profile.barrierModel != BarrierModel::Legacy ||
         profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc ||
         profile.shaderModelMajor != 5 || profile.shaderModelMinor > 1 ||
         profile.rootSignatureMajor != 1 || profile.rootSignatureMinor > 1)
-        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v15 capability", section));
+        return base::Result<TargetProfile, PackageError>::Failure(Error(PackageErrorCode::InvalidTargetProfile, "target profile is outside the supported D3D12 v16 capability", section));
     return base::Result<TargetProfile, PackageError>::Success(profile);
 }
 
@@ -1256,114 +1255,6 @@ base::Result<void, PackageError> ValidateOperations(const D3D12PackageView& view
     return validateStream(view.FrameOperations(), false);
 }
 
-base::Result<void, PackageError> ValidateSliceReferences(D3D12PackageView& view)
-{
-    const auto fail = [](PackageErrorCode code, const char* message, SectionKind section = SectionKind::Manifest)
-    {
-        return base::Result<void, PackageError>::Failure(Error(code, message, section));
-    };
-    const auto& manifest = view.Manifest();
-    if (manifest.resourceCount != view.Resources().size() || manifest.allocationCount != view.Allocations().size() ||
-        manifest.viewCount != view.Views().size() || manifest.shaderCount != view.Shaders().size() ||
-        manifest.programCount != view.Programs().size() || manifest.bindingLayoutCount != view.BindingLayouts().size() ||
-        manifest.executableCount != view.Executables().size() || manifest.rasterCommandCount != view.RasterCommands().size() ||
-        manifest.computeExecutableCount != view.ComputeExecutables().size() || manifest.computeCommandCount != view.ComputeCommands().size() ||
-        manifest.vertexElementCount != view.VertexElements().size() || manifest.attachmentOperationCount != view.AttachmentOperations().size() ||
-        manifest.dynamicSlotCount != view.DynamicSlots().size() || manifest.externalSlotCount != view.ExternalSlots().size() ||
-        manifest.surfaceSlotCount != view.SurfaceSlots().size())
-        return fail(PackageErrorCode::InvalidReference, "manifest counts do not match decoded tables");
-
-    if (view.Resources().size() != 11 || view.Allocations().size() != 8 || view.Views().size() != 14 ||
-        view.Shaders().size() != 3 || view.Programs().size() != 2 || view.BindingLayouts().size() != 2 ||
-        view.RootParameters().size() != 9 || view.VertexElements().size() != 3 || view.Executables().size() != 1 ||
-        view.ComputeExecutables().size() != 1 || view.ComputeCommands().size() != 1 ||
-        view.AttachmentOperations().size() != 1 || view.RasterCommands().size() != 1 ||
-        view.DynamicSlots().size() != 1 || view.ExternalSlots().size() != 1 || view.SurfaceSlots().size() != 1)
-        return fail(PackageErrorCode::InvalidReference, "Slice 13 table cardinality is invalid");
-
-    if (!Dense(view.Resources()) || !Dense(view.Allocations()) || !Dense(view.Views()) || !Dense(view.Shaders()) ||
-        !Dense(view.Programs()) || !Dense(view.BindingLayouts()) || !Dense(view.RootParameters()) ||
-        !Dense(view.Executables()) || !Dense(view.ComputeExecutables()) || !Dense(view.ComputeCommands()) ||
-        !Dense(view.AttachmentOperations()) || !Dense(view.RasterCommands()) || !Dense(view.DynamicSlots()) ||
-        !Dense(view.ExternalSlots()) || !Dense(view.SurfaceSlots()))
-        return fail(PackageErrorCode::InvalidIdSequence, "Package IDs must be dense and ordered");
-
-    const auto& profile = view.Profile();
-    if (profile.framesInFlight != 2 || profile.directQueueCount != 1 || profile.computeQueueCount != 0 ||
-        profile.copyQueueCount != 1 || profile.surfaceImageCount != 2 || profile.rtvDescriptorCount != 2 ||
-        profile.dsvDescriptorCount != 1 || profile.shaderDescriptorCount != 12 || profile.samplerDescriptorCount != 0 ||
-        profile.barrierModel != BarrierModel::Legacy || profile.shaderBinaryFormat != ShaderBinaryFormat::Dxbc)
-        return fail(PackageErrorCode::InvalidTargetProfile, "Slice 13 target profile is invalid", SectionKind::D3D12TargetProfile);
-
-    const auto common = ResourceState{StateClass::Common, 0, 0};
-    for (const std::uint32_t resourceId : {0u, 4u, 5u, 8u, 9u})
-    {
-        const auto& resource = view.Resources()[resourceId];
-        if (resource.resourceKind != ResourceKind::Buffer || resource.origin != ResourceOrigin::PackageOwned ||
-            resource.initialState != common)
-            return fail(PackageErrorCode::InvalidReference,
-                "package-owned default buffers must begin in COMMON", SectionKind::D3D12ResourceTable);
-    }
-
-    const auto shaderRead = ResourceState{StateClass::Explicit, 0, static_cast<std::uint32_t>(ExplicitStateBits::PixelShaderRead)};
-    const auto& externalResource = view.Resources()[10];
-    if (externalResource.resourceKind != ResourceKind::Buffer || externalResource.origin != ResourceOrigin::External ||
-        externalResource.rebuildPolicy != RebuildPolicy::RequireExternalRebind || externalResource.allocation.IsValid() ||
-        externalResource.physicalInstanceCount != 1 || externalResource.sizeBytes != 16 ||
-        externalResource.initialState != shaderRead || externalResource.initialDataSize != 0 ||
-        externalResource.firstView != 13 || externalResource.viewCount != 1)
-        return fail(PackageErrorCode::InvalidReference, "external resource artifact is invalid", SectionKind::D3D12ResourceTable);
-
-    const auto& externalView = view.Views()[13];
-    if (externalView.resource.value != 10 || externalView.viewClass != ViewClass::ShaderResource ||
-        externalView.byteSize != 16 || externalView.strideBytes != 16 || externalView.descriptorHeapClass != 2 ||
-        externalView.descriptorIndex != 10 || externalView.descriptorInstanceStride != 1)
-        return fail(PackageErrorCode::InvalidReference, "external SRV contract is invalid", SectionKind::D3D12ViewTable);
-
-    const auto& externalSlot = view.ExternalSlots()[0];
-    if (externalSlot.resource.value != 10 || externalSlot.requiredKind != ResourceKind::Buffer ||
-        externalSlot.requiredFormat != Format::Unknown || externalSlot.minimumBytes != 16 ||
-        externalSlot.requiredIncomingState != shaderRead || externalSlot.guaranteedOutgoingState != shaderRead ||
-        externalSlot.synchronizationContract != ExternalSynchronizationContract::CompletionTokenRequired ||
-        externalSlot.flags != static_cast<std::uint32_t>(ExternalSlotFlags::Required))
-        return fail(PackageErrorCode::InvalidInvocationSchema, "external slot contract is invalid", SectionKind::D3D12ExternalSlotTable);
-
-    const auto& dynamic = view.DynamicSlots()[0];
-    if (dynamic.destinationResource.value != 1 || dynamic.requiredBytes != 64 || dynamic.requiredAlignment != 16)
-        return fail(PackageErrorCode::InvalidInvocationSchema, "dynamic slot contract is invalid", SectionKind::D3D12DynamicSlotTable);
-    const auto& surface = view.SurfaceSlots()[0];
-    if (surface.imageResource.value != 7 || surface.requiredFormat != Format::B8G8R8A8Unorm)
-        return fail(PackageErrorCode::InvalidInvocationSchema, "surface slot contract is invalid", SectionKind::D3D12SurfaceSlotTable);
-
-    const auto& layouts = view.BindingLayouts();
-    if (layouts[0].parameterRange.first != 0 || layouts[0].parameterRange.count != 6 ||
-        layouts[0].descriptorRange.first != 0 || layouts[0].descriptorRange.count != 5 ||
-        layouts[1].parameterRange.first != 6 || layouts[1].parameterRange.count != 3 ||
-        layouts[1].descriptorRange.first != 5 || layouts[1].descriptorRange.count != 2)
-        return fail(PackageErrorCode::InvalidReference, "binding layout ranges are invalid", SectionKind::D3D12BindingLayoutTable);
-
-    const auto& parameters = view.RootParameters();
-    if (parameters[5].kind != RootParameterKind::ShaderResourceTable || parameters[5].visibility != ShaderVisibility::Pixel ||
-        parameters[5].rootParameterIndex != 5 || parameters[5].shaderRegister != 4 || parameters[5].staticView.value != 13 ||
-        parameters[6].kind != RootParameterKind::ConstantBuffer || parameters[7].kind != RootParameterKind::ShaderResourceTable ||
-        parameters[8].kind != RootParameterKind::UnorderedAccessTable)
-        return fail(PackageErrorCode::InvalidReference, "root parameter contract is invalid", SectionKind::D3D12RootParameterTable);
-
-    for (const auto& shader : view.Shaders())
-    {
-        auto bytes = view.ResolveBlob(shader.bytecode);
-        if (!bytes || base::Sha256(bytes.Value()) != shader.bytecodeDigest)
-            return fail(PackageErrorCode::DigestMismatch, "shader bytecode digest mismatch", SectionKind::D3D12ShaderTable);
-    }
-    for (const auto& layout : view.BindingLayouts())
-    {
-        auto bytes = view.ResolveBlob(layout.serializedRootSignature);
-        if (!bytes || base::Sha256(bytes.Value()) != layout.layoutDigest)
-            return fail(PackageErrorCode::DigestMismatch, "root signature digest mismatch", SectionKind::D3D12BindingLayoutTable);
-    }
-    return ValidateOperations(view);
-}
-
 base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
 {
     const auto fail = [](PackageErrorCode code, const char* message,
@@ -1617,6 +1508,25 @@ base::Result<void, PackageError> ValidateReferences(D3D12PackageView& view)
             return fail(PackageErrorCode::InvalidInvocationSchema, "surface slot contract is invalid",
                         SectionKind::D3D12SurfaceSlotTable);
 
+    const bool hasSurfaceSlot = !view.SurfaceSlots().empty();
+    if (hasSurfaceSlot != (view.Profile().surfaceImageCount != 0))
+        return fail(PackageErrorCode::InvalidTargetProfile,
+                    "surfaceImageCount must be zero exactly when the Package has no Surface slot",
+                    SectionKind::D3D12TargetProfile);
+    const auto surfaceResourceCount = static_cast<std::size_t>(std::count_if(
+        view.Resources().begin(), view.Resources().end(), [](const ResourceArtifact& resource) {
+            return resource.origin == ResourceOrigin::Surface;
+        }));
+    if (surfaceResourceCount != view.SurfaceSlots().size())
+        return fail(PackageErrorCode::InvalidInvocationSchema,
+                    "Surface resources and Surface slots must have one-to-one correspondence",
+                    SectionKind::D3D12SurfaceSlotTable);
+    if (!hasSurfaceSlot && std::any_of(view.Resources().begin(), view.Resources().end(),
+        [](const ResourceArtifact& resource) { return resource.extentMode == ExtentMode::SurfaceRelative; }))
+        return fail(PackageErrorCode::InvalidReference,
+                    "a surface-relative Package resource requires a Surface slot",
+                    SectionKind::D3D12ResourceTable);
+
     return ValidateOperations(view);
 }
 }
@@ -1627,7 +1537,7 @@ base::Result<std::vector<std::byte>, PackageError> BuildFrozenPackage(const D3D1
         return base::Result<std::vector<std::byte>, PackageError>::Failure(Error(PackageErrorCode::InvalidIdSequence, "description IDs must be dense and ordered"));
     if (description.operationStreams.size() != 2 || description.operationStreams[0].kind != OperationStreamKind::Load ||
         description.operationStreams[1].kind != OperationStreamKind::Frame)
-        return base::Result<std::vector<std::byte>, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "slice 12 requires exactly load and frame streams"));
+        return base::Result<std::vector<std::byte>, PackageError>::Failure(Error(PackageErrorCode::InvalidOperationStream, "a Package requires exactly one load stream followed by one frame stream"));
 
     PackageManifest manifest;
     manifest.resourceCount = static_cast<std::uint32_t>(description.resources.size());

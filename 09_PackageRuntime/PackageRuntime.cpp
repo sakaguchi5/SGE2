@@ -5,7 +5,7 @@ namespace sge::runtime
 base::Result<LoadedPackage, RuntimeError> LoadPackage(
     package::FrozenExecutablePackage package,
     IPackageExecutor& executor,
-    ISurfaceHost& surface)
+    ISurfaceHost* surface)
 {
     auto sharedPackage = std::make_shared<const package::FrozenExecutablePackage>(std::move(package));
     auto instance = executor.Load(sharedPackage, surface);

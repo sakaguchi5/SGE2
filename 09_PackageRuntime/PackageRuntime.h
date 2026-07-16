@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sge::runtime
@@ -134,7 +135,7 @@ public:
     virtual ~IPackageExecutor() = default;
     [[nodiscard]] virtual base::Result<std::unique_ptr<IPackageInstance>, RuntimeError> Load(
         std::shared_ptr<const package::FrozenExecutablePackage> package,
-        ISurfaceHost& surface) = 0;
+        ISurfaceHost* surface) = 0;
     [[nodiscard]] virtual base::Result<FrameSubmission, RuntimeError> Submit(
         IPackageInstance& instance,
         const FrameInvocation& invocation) = 0;
@@ -158,7 +159,7 @@ private:
     friend base::Result<LoadedPackage, RuntimeError> LoadPackage(
         package::FrozenExecutablePackage,
         IPackageExecutor&,
-        ISurfaceHost&);
+        ISurfaceHost*);
     LoadedPackage(std::shared_ptr<const package::FrozenExecutablePackage> package, std::unique_ptr<IPackageInstance> instance)
         : package_(std::move(package)), instance_(std::move(instance)) {}
     std::shared_ptr<const package::FrozenExecutablePackage> package_;
@@ -168,7 +169,22 @@ private:
 [[nodiscard]] base::Result<LoadedPackage, RuntimeError> LoadPackage(
     package::FrozenExecutablePackage package,
     IPackageExecutor& executor,
-    ISurfaceHost& surface);
+    ISurfaceHost* surface);
+
+[[nodiscard]] inline base::Result<LoadedPackage, RuntimeError> LoadPackage(
+    package::FrozenExecutablePackage package,
+    IPackageExecutor& executor,
+    ISurfaceHost& surface)
+{
+    return LoadPackage(std::move(package), executor, &surface);
+}
+
+[[nodiscard]] inline base::Result<LoadedPackage, RuntimeError> LoadPackage(
+    package::FrozenExecutablePackage package,
+    IPackageExecutor& executor)
+{
+    return LoadPackage(std::move(package), executor, nullptr);
+}
 
 [[nodiscard]] base::Result<FrameSubmission, RuntimeError> Submit(
     LoadedPackage& loaded,
